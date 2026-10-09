@@ -1,0 +1,90 @@
+{
+  "entities": {
+    "Room": {
+      "title": "Room",
+      "description": "Multiplayer game room for PvP matchmaking and real-time state synchronization.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "description": "Room code for joining and identification",
+          "maxLength": 32
+        },
+        "game": {
+          "type": "string",
+          "description": "Identifier of the game type",
+          "maxLength": 32
+        },
+        "seatsNeeded": {
+          "type": "number",
+          "description": "Total seats required for match"
+        },
+        "seats": {
+          "type": "array",
+          "description": "Array of active player IDs"
+        },
+        "names": {
+          "type": "object",
+          "description": "Map of player ID to username"
+        },
+        "avatars": {
+          "type": "object",
+          "description": "Map of player ID to avatar string"
+        },
+        "turn": {
+          "type": "number",
+          "description": "Current turn or move counter"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["waiting", "playing", "done"],
+          "description": "Current status of the room"
+        },
+        "host": {
+          "type": "string",
+          "description": "User ID of the room creator",
+          "maxLength": 128
+        },
+        "created": {
+          "type": "number",
+          "description": "Timestamp when room was created"
+        },
+        "state": {
+          "type": "object",
+          "description": "Game-specific serialized board or round state"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp when room was last updated"
+        }
+      },
+      "required": ["code", "game", "seatsNeeded", "seats", "host", "status"]
+    },
+    "TestConnection": {
+      "title": "TestConnection",
+      "description": "System health check document to test database connection on application boot.",
+      "type": "object",
+      "properties": {
+        "ok": {
+          "type": "boolean",
+          "description": "Health status boolean"
+        },
+        "timestamp": {
+          "type": "number",
+          "description": "Timestamp of probe check"
+        }
+      },
+      "required": ["ok"]
+    }
+  },
+  "firestore": {
+    "/rooms/{roomId}": {
+      "schema": "Room",
+      "description": "Realtime multiplayer game rooms accessible across devices."
+    },
+    "/test/{docId}": {
+      "schema": "TestConnection",
+      "description": "Database connection test probe collection."
+    }
+  }
+}

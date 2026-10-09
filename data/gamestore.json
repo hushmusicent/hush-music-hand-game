@@ -1,0 +1,125 @@
+{
+  "users": {
+    "u_veno2": {
+      "uid": "u_veno2",
+      "username": "Veno2",
+      "points": 1000,
+      "wins": {},
+      "avatar": "🎧"
+    },
+    "u_tester_phone": {
+      "uid": "u_tester_phone",
+      "username": "TESTER",
+      "points": 1000,
+      "wins": {},
+      "avatar": "🎧"
+    },
+    "u_tester1": {
+      "uid": "u_tester1",
+      "username": "TestHost",
+      "avatar": "🎧",
+      "email": "testhost@example.com",
+      "points": 1000,
+      "wins": {},
+      "lastDaily": 1791491171194
+    },
+    "u_mv000y2j_lni4": {
+      "uid": "u_mv000y2j_lni4",
+      "username": "PwTester_mv000y2g",
+      "email": "pwtester_mv000y2g@example.com",
+      "passwordSalt": "a7a6a5ec6d714a5cf79e5ffc984b0040",
+      "passwordHash": "e6ce45d07cbc4af8a48301f404cc8b3156bc78af65eb11386a0588c524bc9dbf",
+      "points": 1000,
+      "wins": {},
+      "lastDaily": 0,
+      "avatar": "🎮",
+      "lastSeen": 1791491906683
+    },
+    "u_mv08i1u1_fjf3": {
+      "uid": "u_mv08i1u1_fjf3",
+      "username": "AutoReg_1797",
+      "email": "autoreg_1797@example.com",
+      "passwordSalt": "4ec971c992c8cbdaefacfa6132262ee3",
+      "passwordHash": "6a6ea24a0d189c04f3ed4123379c050e39ea365cee1084782d6be209e51741ad",
+      "points": 1000,
+      "wins": {},
+      "lastDaily": 0,
+      "avatar": "🌟",
+      "lastSeen": 1791506141641
+    },
+    "u_mv08pw3u_ovta": {
+      "uid": "u_mv08pw3u_ovta",
+      "username": "test3",
+      "email": "hushmusicent419@gmail.com",
+      "points": 1500,
+      "wins": {},
+      "lastDaily": 1791511449916,
+      "avatar": "👑",
+      "lastSeen": 1791506507466
+    },
+    "u_aaaa": {
+      "avatar": "🎧",
+      "email": "hushmusicent419@gmail.com",
+      "lastDaily": 0,
+      "lastSeen": 1791506132097,
+      "points": 1000,
+      "uid": "u_aaaa",
+      "username": "AAAA",
+      "wins": {}
+    },
+    "u_mv00f203_zvi8": {
+      "avatar": "🎙️",
+      "email": "calvintking2@gmail.com",
+      "lastDaily": 1791492574062,
+      "lastSeen": 1791506629164,
+      "points": 1500,
+      "uid": "u_mv00f203_zvi8",
+      "username": "tester2",
+      "wins": {}
+    },
+    "u_mv07ne65_oyue": {
+      "avatar": "👑",
+      "email": "hushmusicent419@gmail.com",
+      "lastDaily": 0,
+      "lastSeen": 1791506043970,
+      "points": 1000,
+      "uid": "u_mv07ne65_oyue",
+      "username": "aaaa",
+      "wins": {}
+    },
+    "u_test_verify": {
+      "avatar": "🎯",
+      "email": "rtdb_tester@example.com",
+      "lastSeen": 1791503871829,
+      "points": 1250,
+      "uid": "u_test_verify",
+      "username": "RTDB_Tester",
+      "wins": {
+        "spades": 2
+      }
+    },
+    "u_tester2": {
+      "avatar": "🎮",
+      "email": "tester2@example.com",
+      "lastDaily": 0,
+      "lastSeen": 1791506132097,
+      "points": 1000,
+      "uid": "u_tester2",
+      "username": "TESTER2",
+      "wins": {}
+    }
+  },
+  "chat": {},
+  "friends": {
+    "u_veno2": [],
+    "u_tester_phone": []
+  },
+  "requests": {
+    "u_veno2": [],
+    "u_tester_phone": [],
+    "u_mv000y2j_lni4": [],
+    "u_mv08i1u1_fjf3": [],
+    "u_mv08pw3u_ovta": []
+  },
+  "pendingInvites": {}
+}

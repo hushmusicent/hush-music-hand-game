@@ -1,0 +1,48 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidRoom(data) {
+      return data.keys().hasAll(['code', 'game', 'seatsNeeded', 'seats', 'host', 'status'])
+        && data.keys().hasOnly(['code', 'game', 'seatsNeeded', 'seats', 'names', 'avatars', 'turn', 'status', 'host', 'created', 'state', 'updatedAt'])
+        && data.code is string && data.code.size() <= 32
+        && data.game is string && data.game.size() <= 32
+        && data.seatsNeeded is number && data.seatsNeeded >= 1 && data.seatsNeeded <= 8
+        && data.seats is list && data.seats.size() <= 8
+        && data.status in ['waiting', 'playing', 'done']
+        && data.host is string && data.host.size() <= 128
+        && (!('turn' in data) || data.turn is number)
+        && (!('names' in data) || data.names is map)
+        && (!('avatars' in data) || data.avatars is map)
+        && (!('created' in data) || data.created is number)
+        && (!('updatedAt' in data) || data.updatedAt is number)
+        && (!('state' in data) || data.state == null || data.state is map);
+    }
+
+    // Health check collection for connection testing
+    match /test/{docId} {
+      allow read, write: if isValidId(docId);
+    }
+
+    // Multiplayer game rooms
+    match /rooms/{roomId} {
+      allow get: if isValidId(roomId);
+      allow list: if true;
+      allow create: if isValidId(roomId)
+        && isValidRoom(request.resource.data)
+        && request.resource.data.code == roomId;
+      allow update: if isValidId(roomId)
+        && isValidRoom(request.resource.data);
+      allow delete: if isValidId(roomId);
+    }
+  }
+}

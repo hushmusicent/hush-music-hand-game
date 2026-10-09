@@ -1,0 +1,6 @@
+{
+  "name": "Hush Music Hand Game",
+  "description": "Play classic card, board, and casino games with Hush Music Hand Game — featuring Spades, Poker, Blackjack, Dominoes, Chess, Checkers, and more with multiplayer and points.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
