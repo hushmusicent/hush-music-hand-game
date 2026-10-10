@@ -157,13 +157,17 @@ export const Backend = {
         wins: {},
         lastDaily: 0,
         avatar,
-        password: cleanPassword,
       };
 
+      // Storage.saveUser hashes password with bcrypt before saving and deletes password field
+      (newUser as any).password = cleanPassword;
       Storage.saveUser(newUser);
       Storage.setSession(newUser);
       this.syncUser(newUser);
-      return newUser;
+
+      // Never return password field when reading or returning player data
+      const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = newUser as any;
+      return safeUser as User;
     }
   },
 
@@ -202,22 +206,18 @@ export const Backend = {
       // Offline fallback
       const cleanLower = clean.toLowerCase();
       const byEmail = Storage.getUserByEmail(cleanLower);
-      if (byEmail) {
-        if (byEmail.password && byEmail.password !== cleanPassword) {
-          throw new Error('Incorrect password. Please try again.');
-        }
-        Storage.setSession(byEmail);
-        this.syncUser(byEmail);
-        return byEmail;
-      }
       const byUser = Storage.getUserByUsername(cleanLower);
-      if (byUser) {
-        if (byUser.password && byUser.password !== cleanPassword) {
+      const targetUser = byEmail || byUser;
+
+      if (targetUser) {
+        const isValid = Storage.verifyOfflinePassword(clean, cleanPassword);
+        if (!isValid) {
           throw new Error('Incorrect password. Please try again.');
         }
-        Storage.setSession(byUser);
-        this.syncUser(byUser);
-        return byUser;
+        Storage.setSession(targetUser);
+        this.syncUser(targetUser);
+        const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = targetUser as any;
+        return safeUser as User;
       }
       throw new Error('Account not found. Please check your credentials or create an account.');
     }
@@ -305,11 +305,13 @@ export const Backend = {
       const cleanLower = clean.toLowerCase();
       const user = Storage.getUserByEmail(cleanLower) || Storage.getUserByUsername(cleanLower);
       if (!user) throw new Error('Account not found.');
-      const updated: User = { ...user, password: cleanPass };
+      const updated: User = { ...user };
+      (updated as any).password = cleanPass;
       Storage.saveUser(updated);
       Storage.setSession(updated);
       this.syncUser(updated);
-      return updated;
+      const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = updated as any;
+      return safeUser as User;
     }
   },
 
@@ -1160,12 +1162,13 @@ export const Backend = {
   },
 
   syncUser(user: User): void {
-    savePlayerToRTDB(user).catch(() => {});
+    const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = user as any;
+    savePlayerToRTDB(safeUser as User).catch(() => {});
     try {
       fetch('/api/users/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user }),
+        body: JSON.stringify({ user: safeUser }),
       }).catch(() => {});
     } catch {}
   },

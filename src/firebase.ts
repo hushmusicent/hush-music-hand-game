@@ -22,6 +22,7 @@ import {
   onValue as rtdbOnValue,
   Database,
 } from 'firebase/database';
+import bcrypt from 'bcryptjs';
 import firebaseConfig from '../firebase-applet-config.json';
 import { Room, GameId, User, FriendRequest, ChatMessage } from './types';
 
@@ -127,9 +128,17 @@ export async function savePlayerToRTDB(player: User): Promise<void> {
     lastSeen: Date.now(),
   };
 
-  if (player.password) {
-    payload.password = player.password;
+  // Hash password with bcrypt before saving if provided
+  const rawPass = (player as any).password;
+  if (rawPass && typeof rawPass === 'string') {
+    payload.passwordHash = rawPass.startsWith('$2')
+      ? rawPass
+      : bcrypt.hashSync(rawPass, 10);
+  } else if ((player as any).passwordHash) {
+    payload.passwordHash = (player as any).passwordHash;
   }
+  delete payload.password;
+  delete payload.passwordSalt;
 
   try {
     // Write to both /players and /users so it's prominent in Firebase Data console
@@ -145,15 +154,20 @@ export async function savePlayerToRTDB(player: User): Promise<void> {
 export async function getPlayerFromRTDB(uid: string): Promise<User | null> {
   if (!uid) return null;
   try {
+    let raw: any = null;
     const snap = await rtdbGet(rtdbRef(rtdb, `players/${uid}`));
     if (snap.exists()) {
-      return snap.val() as User;
+      raw = snap.val();
+    } else {
+      const userSnap = await rtdbGet(rtdbRef(rtdb, `users/${uid}`));
+      if (userSnap.exists()) {
+        raw = userSnap.val();
+      }
     }
-    const userSnap = await rtdbGet(rtdbRef(rtdb, `users/${uid}`));
-    if (userSnap.exists()) {
-      return userSnap.val() as User;
-    }
-    return null;
+    if (!raw) return null;
+    // Never return the password, passwordHash, or passwordSalt field when reading player data
+    const { password, passwordHash, passwordSalt, ...safeUser } = raw;
+    return safeUser as User;
   } catch (err) {
     console.warn('Error reading player from Realtime Database:', err);
     return null;
@@ -163,24 +177,27 @@ export async function getPlayerFromRTDB(uid: string): Promise<User | null> {
 export async function getAllPlayersFromRTDB(): Promise<User[]> {
   try {
     const snap = await rtdbGet(rtdbRef(rtdb, 'players'));
+    let rawList: any[] = [];
     if (!snap.exists()) {
       const uSnap = await rtdbGet(rtdbRef(rtdb, 'users'));
-      if (!uSnap.exists()) return [];
-      const val = uSnap.val() as Record<string, User>;
-      return Object.values(val || {}).filter(
+      if (uSnap.exists()) {
+        rawList = Object.values((uSnap.val() || {}) as Record<string, any>);
+      }
+    } else {
+      rawList = Object.values((snap.val() || {}) as Record<string, any>);
+    }
+    return rawList
+      .filter(
         (u) =>
           u &&
           u.uid !== 'u_zbs0jd0' &&
           u.username?.toLowerCase() !== 'kingveno'
-      );
-    }
-    const val = snap.val() as Record<string, User>;
-    return Object.values(val || {}).filter(
-      (u) =>
-        u &&
-        u.uid !== 'u_zbs0jd0' &&
-        u.username?.toLowerCase() !== 'kingveno'
-    );
+      )
+      .map((u) => {
+        // Never return password fields when reading player data
+        const { password, passwordHash, passwordSalt, ...safeUser } = u;
+        return safeUser as User;
+      });
   } catch (err) {
     console.warn('Error fetching all players from Realtime Database:', err);
     return [];
@@ -208,12 +225,18 @@ export function subscribeToPlayers(onUpdate: (players: User[]) => void): () => v
     if (!snap.exists()) {
       onUpdate([]);
     } else {
-      const list = Object.values((snap.val() || {}) as Record<string, User>).filter(
-        (u) =>
-          u &&
-          u.uid !== 'u_zbs0jd0' &&
-          u.username?.toLowerCase() !== 'kingveno'
-      );
+      const list = Object.values((snap.val() || {}) as Record<string, any>)
+        .filter(
+          (u) =>
+            u &&
+            u.uid !== 'u_zbs0jd0' &&
+            u.username?.toLowerCase() !== 'kingveno'
+        )
+        .map((u) => {
+          // Never return password fields when reading player data
+          const { password, passwordHash, passwordSalt, ...safeUser } = u;
+          return safeUser as User;
+        });
       onUpdate(list);
     }
   });

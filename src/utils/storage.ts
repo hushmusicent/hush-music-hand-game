@@ -1,4 +1,5 @@
 import { User, Room, ChatMessage, FriendRequest } from '../types';
+import bcrypt from 'bcryptjs';
 
 export const STARTING_POINTS = 1000;
 export const DAILY_BONUS = 500;
@@ -43,48 +44,70 @@ export const setStored = <T>(key: string, value: T): void => {
 
 export const Storage = {
   getUsers(): Record<string, User> {
-    const users = getStored<Record<string, User>>(STORAGE_KEYS.USERS, {});
-    for (const [uid, u] of Object.entries(users)) {
+    const rawUsers = getStored<Record<string, any>>(STORAGE_KEYS.USERS, {});
+    const cleanUsers: Record<string, User> = {};
+    for (const [uid, u] of Object.entries(rawUsers)) {
       if (
+        !u ||
         u.username?.toLowerCase().trim() === 'kingveno' ||
         uid === 'u_zbs0jd0'
       ) {
-        delete users[uid];
+        continue;
       }
+      // Never return the password, passwordHash, or passwordSalt field when reading player data
+      const { password, passwordHash, passwordSalt, ...safeUser } = u;
+      cleanUsers[uid] = safeUser as User;
     }
-    return users;
+    return cleanUsers;
   },
 
   deleteUser(uidOrEmail: string) {
-    const users = this.getUsers();
+    const rawUsers = getStored<Record<string, any>>(STORAGE_KEYS.USERS, {});
     const clean = uidOrEmail.toLowerCase().trim();
-    for (const [uid, u] of Object.entries(users)) {
+    for (const [uid, u] of Object.entries(rawUsers)) {
       if (
         uid.toLowerCase() === clean ||
-        u.email.toLowerCase() === clean ||
-        u.username.toLowerCase() === clean
+        u.email?.toLowerCase() === clean ||
+        u.username?.toLowerCase() === clean
       ) {
-        delete users[uid];
+        delete rawUsers[uid];
       }
     }
-    setStored(STORAGE_KEYS.USERS, users);
+    setStored(STORAGE_KEYS.USERS, rawUsers);
     const session = this.getSession();
     if (
       session &&
       (session.uid.toLowerCase() === clean ||
-        session.email.toLowerCase() === clean ||
-        session.username.toLowerCase() === clean)
+        session.email?.toLowerCase() === clean ||
+        session.username?.toLowerCase() === clean)
     ) {
       this.setSession(null);
     }
   },
 
   saveUser(user: User) {
-    const users = this.getUsers();
-    users[user.uid] = user;
-    setStored(STORAGE_KEYS.USERS, users);
+    const rawUsers = getStored<Record<string, any>>(STORAGE_KEYS.USERS, {});
+    const userToSave: Record<string, any> = { ...user };
+
+    // Hash password with bcrypt before saving if provided
+    const rawPass = (userToSave as any).password;
+    if (rawPass && typeof rawPass === 'string') {
+      userToSave.passwordHash = rawPass.startsWith('$2')
+        ? rawPass
+        : bcrypt.hashSync(rawPass, 10);
+      delete userToSave.password;
+    } else if ((user as any).passwordHash) {
+      userToSave.passwordHash = (user as any).passwordHash;
+      delete userToSave.password;
+    }
+
+    rawUsers[user.uid] = userToSave;
+    setStored(STORAGE_KEYS.USERS, rawUsers);
+
+    // Never store or keep password in session when reading/updating session
     if (this.getSession()?.uid === user.uid) {
-      this.setSession(user);
+      const { password, passwordHash, passwordSalt, ...safeUser } = userToSave;
+      this.setSession(safeUser as User);
     }
   },
 
@@ -98,12 +121,50 @@ export const Storage = {
     return Object.values(users).find((u) => u.username.toLowerCase() === username.toLowerCase());
   },
 
+  // Secure offline password verification without exposing password on player reads
+  verifyOfflinePassword(identifier: string, rawPassword: string): boolean {
+    const rawUsers = getStored<Record<string, any>>(STORAGE_KEYS.USERS, {});
+    const clean = identifier.trim().toLowerCase();
+    const found = Object.values(rawUsers).find(
+      (u) =>
+        u &&
+        (u.email?.toLowerCase() === clean ||
+          u.username?.toLowerCase() === clean)
+    );
+    if (!found) return false;
+    const storedHash = found.passwordHash || (found.password && found.password.startsWith('$2') ? found.password : null);
+    if (storedHash) {
+      try {
+        return bcrypt.compareSync(rawPassword, storedHash);
+      } catch {
+        return false;
+      }
+    }
+    // Backward compatibility for legacy plain text passwords in offline store: upgrade to bcrypt
+    if (found.password && found.password === rawPassword) {
+      found.passwordHash = bcrypt.hashSync(rawPassword, 10);
+      delete found.password;
+      rawUsers[found.uid] = found;
+      setStored(STORAGE_KEYS.USERS, rawUsers);
+      return true;
+    }
+    return false;
+  },
+
   getSession(): User | null {
-    return getStored<User | null>(STORAGE_KEYS.SESSION, null);
+    const sess = getStored<any>(STORAGE_KEYS.SESSION, null);
+    if (!sess) return null;
+    const { password, passwordHash, passwordSalt, ...safe } = sess;
+    return safe as User;
   },
 
   setSession(user: User | null) {
-    setStored(STORAGE_KEYS.SESSION, user);
+    if (!user) {
+      setStored(STORAGE_KEYS.SESSION, null);
+      return;
+    }
+    const { password, passwordHash, passwordSalt, ...safe } = user as any;
+    setStored(STORAGE_KEYS.SESSION, safe);
   },
 
   // Rooms

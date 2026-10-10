@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'node:crypto';
+import bcrypt from 'bcryptjs';
 import { fileURLToPath } from 'url';
 import { initializeApp, getApps } from 'firebase/app';
 import {
@@ -545,23 +546,38 @@ app.get('/api/health', (_req, res) => {
 });
 
 // Helper functions for secure password hashing and user sanitization
-function hashPassword(password: string, salt = crypto.randomBytes(16).toString('hex')): { salt: string; hash: string } {
-  const hash = crypto.createHash('sha256').update(`${salt}:${password}`).digest('hex');
-  return { salt, hash };
+const BCRYPT_SALT_ROUNDS = 10;
+
+function hashPassword(password: string): string {
+  return bcrypt.hashSync(password, BCRYPT_SALT_ROUNDS);
 }
 
-function verifyPassword(password: string, salt: string, expectedHash: string): boolean {
-  const hash = crypto.createHash('sha256').update(`${salt}:${password}`).digest('hex');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(expectedHash, 'hex'));
-  } catch {
-    return hash === expectedHash;
+function verifyPassword(password: string, storedHashOrLegacyHash: string, salt?: string): boolean {
+  if (!storedHashOrLegacyHash) return false;
+  // If stored hash is bcrypt ($2a$, $2b$, $2y$)
+  if (storedHashOrLegacyHash.startsWith('$2')) {
+    try {
+      return bcrypt.compareSync(password, storedHashOrLegacyHash);
+    } catch {
+      return false;
+    }
   }
+  // Backward compatibility with legacy sha256 hashes
+  if (salt) {
+    const legacyHash = crypto.createHash('sha256').update(`${salt}:${password}`).digest('hex');
+    try {
+      return crypto.timingSafeEqual(Buffer.from(legacyHash, 'hex'), Buffer.from(storedHashOrLegacyHash, 'hex'));
+    } catch {
+      return legacyHash === storedHashOrLegacyHash;
+    }
+  }
+  return false;
 }
 
 function sanitizeUser(u: any) {
   if (!u) return null;
-  const { passwordHash, passwordSalt, ...safe } = u;
+  // Never return password, passwordHash, or passwordSalt when reading player data
+  const { password, passwordHash, passwordSalt, ...safe } = u;
   return {
     ...safe,
     points: typeof safe.points === 'number' ? safe.points : 1000,
@@ -675,10 +691,11 @@ app.post('/api/users/recover/reset', (req, res) => {
     return res.status(404).json({ error: 'Account not found.' });
   }
 
-  // Hash new password and save
-  const { salt, hash } = hashPassword(newPassword.trim());
-  user.passwordSalt = salt;
+  // Hash new password with bcrypt and save
+  const hash = hashPassword(newPassword.trim());
   user.passwordHash = hash;
+  delete user.passwordSalt;
+  delete (user as any).password;
   user.lastSeen = Date.now();
   users.set(user.uid, user);
 
@@ -725,16 +742,23 @@ app.post('/api/users/login', (req, res) => {
 
   // If user already has a password set, verify it
   if (found.passwordHash) {
-    const salt = found.passwordSalt || 'hush_music_default_salt';
-    const isCorrect = verifyPassword(password, salt, found.passwordHash);
+    const isCorrect = verifyPassword(password, found.passwordHash, found.passwordSalt);
     if (!isCorrect) {
       return res.status(401).json({ error: 'Incorrect password. Please try again.' });
     }
+    // Automatically upgrade legacy sha256 hashes to bcrypt on successful login
+    if (!found.passwordHash.startsWith('$2')) {
+      found.passwordHash = hashPassword(password);
+      delete found.passwordSalt;
+      delete (found as any).password;
+      users.set(found.uid, found);
+      persistStore();
+    }
   } else {
     // If existing account was created prior to password requirement, set their password now on login
-    const { salt, hash } = hashPassword(password);
-    found.passwordSalt = salt;
-    found.passwordHash = hash;
+    found.passwordHash = hashPassword(password);
+    delete found.passwordSalt;
+    delete (found as any).password;
     users.set(found.uid, found);
     persistStore();
   }
@@ -773,17 +797,22 @@ app.post('/api/users/signup', (req, res) => {
   if (existing) {
     // If account exists, verify password before allowing login
     if (existing.passwordHash) {
-      const salt = existing.passwordSalt || 'hush_music_default_salt';
-      if (!verifyPassword(password, salt, existing.passwordHash)) {
+      if (!verifyPassword(password, existing.passwordHash, existing.passwordSalt)) {
         return res.status(400).json({
           error: 'An account with this username or email already exists with a different password.',
         });
       }
+      // Upgrade to bcrypt if needed
+      if (!existing.passwordHash.startsWith('$2')) {
+        existing.passwordHash = hashPassword(password);
+        delete existing.passwordSalt;
+        delete (existing as any).password;
+      }
     } else {
       // Set password for existing legacy account
-      const { salt, hash } = hashPassword(password);
-      existing.passwordSalt = salt;
-      existing.passwordHash = hash;
+      existing.passwordHash = hashPassword(password);
+      delete existing.passwordSalt;
+      delete (existing as any).password;
     }
 
     if (avatar) existing.avatar = avatar;
@@ -795,13 +824,12 @@ app.post('/api/users/signup', (req, res) => {
     return res.json({ ok: true, user: sanitizeUser(existing), isExisting: true });
   }
 
-  const { salt, hash } = hashPassword(password);
+  const hash = hashPassword(password);
   const newUid = `u_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
   const newUser = {
     uid: newUid,
     username: cleanUser,
     email: cleanEmail,
-    passwordSalt: salt,
     passwordHash: hash,
     points: 1000,
     wins: {},
@@ -880,7 +908,7 @@ app.post('/api/users/guest', (req, res) => {
   users.set(guestUid, guestUser);
   persistStore();
   syncPlayerToRTDB(guestUser).catch(() => {});
-  res.json({ ok: true, user: guestUser });
+  res.json({ ok: true, user: sanitizeUser(guestUser) });
 });
 
 function deliverPendingInvites(user: { uid: string; username: string; email?: string }) {
@@ -1086,7 +1114,7 @@ app.post('/api/users/sync', (req, res) => {
       return res.status(404).json({ error: 'This account has been permanently erased.', erased: true });
     }
     const existing = users.get(user.uid) || {};
-    const { passwordHash: _ph, passwordSalt: _ps, ...safeUser } = user;
+    const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = user;
     const updated = {
       ...existing,
       ...safeUser,
