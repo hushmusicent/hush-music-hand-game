@@ -88,10 +88,21 @@ export const BackgammonGame: React.FC<BackgammonGameProps> = ({
     : 'w';
   const isMyTurn = !state.over && state.turn === mySide && !botMoving;
 
+  const recordedWinRef = useRef(false);
+
   // Sync PvP room state
   useEffect(() => {
     if (pvpRoom && pvpRoom.state) {
       setState(pvpRoom.state);
+      if (
+        (pvpRoom.status === 'done' || pvpRoom.state.over) &&
+        pvpRoom.state.winner === mySide &&
+        !recordedWinRef.current
+      ) {
+        recordedWinRef.current = true;
+        const { user: updatedUser } = Backend.recordWin(user, 'backgammon');
+        onUpdateUser(updatedUser);
+      }
     } else if (pvpRoom && !pvpRoom.state && pvpRoom.host === user.uid) {
       Backend.updateRoom({
         ...pvpRoom,
@@ -99,7 +110,7 @@ export const BackgammonGame: React.FC<BackgammonGameProps> = ({
         turn: 0,
       });
     }
-  }, [pvpRoom]);
+  }, [pvpRoom, mySide]);
 
   // Cleanup timers on unmount
   useEffect(() => {
@@ -385,7 +396,16 @@ export const BackgammonGame: React.FC<BackgammonGameProps> = ({
       setValidMoves([]);
       setStatusMessage('🎉 Victory! You bore off all 15 checkers!');
       Sound.jackpot();
-      onUpdateUser({ ...user, points: user.points + 100 });
+      recordedWinRef.current = true;
+      const { user: updatedUser } = Backend.recordWin(user, 'backgammon');
+      onUpdateUser(updatedUser);
+      if (pvpRoom) {
+        Backend.updateRoom({
+          ...pvpRoom,
+          state: wonState,
+          status: 'done',
+        });
+      }
       return;
     }
 

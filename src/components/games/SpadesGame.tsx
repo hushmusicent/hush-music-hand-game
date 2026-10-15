@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Card, User, Room } from '../../types';
 import { createDeck, getRankValue, SUITS } from '../../utils/cards';
 import { CardComponent } from '../CardComponent';
@@ -142,6 +142,8 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
     });
   };
 
+  const recordedWinRef = useRef(false);
+
   useEffect(() => {
     if (pvpRoom && pvpRoom.game === 'spades' && pvpRoom.state) {
       const s = pvpRoom.state;
@@ -158,6 +160,15 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
         broken: !!s.broken,
         over: !!s.over,
       });
+
+      if (s.over && !recordedWinRef.current) {
+        const scores = Array.isArray(s.scores) ? s.scores : [0, 0, 0, 0];
+        if (scores[mySeat] === Math.max(...scores)) {
+          recordedWinRef.current = true;
+          const { user: updatedUser } = Backend.recordWin(user, 'spades');
+          onUpdateUser(updatedUser);
+        }
+      }
     } else if (pvpRoom && pvpRoom.game === 'spades' && !pvpRoom.state && pvpRoom.host === user.uid) {
       // Host syncs initial state to server room so all players share the exact same hand & deck
       Backend.updateRoom({
@@ -166,7 +177,7 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
         turn: state.turn,
       });
     }
-  }, [pvpRoom]);
+  }, [pvpRoom, mySeat]);
 
   const safeScores = Array.isArray(state?.scores) ? state.scores : [0, 0, 0, 0];
   const safeBids = normalizeBids(state?.bids);
@@ -475,12 +486,20 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
       if (matchWon) {
         setState(nextState);
         if (nextScores[mySeat] === Math.max(...nextScores)) {
+          recordedWinRef.current = true;
           const { user: updatedUser } = Backend.recordWin(user, 'spades');
           onUpdateUser(updatedUser);
           setMessage(`🎉 Spades Champion! You won with ${nextScores[mySeat]} points!`);
         } else {
           Sound.lose();
           setMessage('Spades match ended. Opponent reached 250 first.');
+        }
+        if (pvpRoom) {
+          Backend.updateRoom({
+            ...pvpRoom,
+            state: nextState,
+            status: 'done',
+          });
         }
       } else {
         const fresh = initSpadesHand();

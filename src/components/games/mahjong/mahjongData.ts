@@ -49,48 +49,29 @@ export const DIFFICULTY_TIERS: DifficultyTier[] = [
 ];
 
 export const MAHJONG_TILES = [
-  // Characters (Wan)
-  { id: 'c1', symbol: '🀇', name: '1 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c2', symbol: '🀈', name: '2 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c3', symbol: '🀉', name: '3 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c4', symbol: '🀊', name: '4 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c5', symbol: '🀋', name: '5 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c6', symbol: '🀌', name: '6 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c7', symbol: '🀍', name: '7 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c8', symbol: '🀎', name: '8 Character', category: 'character', color: '#b91c1c' },
-  { id: 'c9', symbol: '🀏', name: '9 Character', category: 'character', color: '#b91c1c' },
-  // Bamboo (Tiao)
-  { id: 'b1', symbol: '🀐', name: '1 Bamboo (Sparrow)', category: 'bamboo', color: '#047857' },
-  { id: 'b2', symbol: '🀑', name: '2 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b3', symbol: '🀒', name: '3 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b4', symbol: '🀓', name: '4 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b5', symbol: '🀔', name: '5 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b6', symbol: '🀕', name: '6 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b7', symbol: '🀖', name: '7 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b8', symbol: '🀗', name: '8 Bamboo', category: 'bamboo', color: '#047857' },
-  { id: 'b9', symbol: '🀘', name: '9 Bamboo', category: 'bamboo', color: '#047857' },
-  // Circles / Dots (Tong)
-  { id: 'd1', symbol: '🀙', name: '1 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd2', symbol: '🀚', name: '2 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd3', symbol: '🀛', name: '3 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd4', symbol: '🀜', name: '4 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd5', symbol: '🀝', name: '5 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd6', symbol: '🀞', name: '6 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd7', symbol: '🀟', name: '7 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd8', symbol: '🀠', name: '8 Circle', category: 'circle', color: '#1d4ed8' },
-  { id: 'd9', symbol: '🀡', name: '9 Circle', category: 'circle', color: '#1d4ed8' },
-  // Dragons
-  { id: 'dr', symbol: '🀄', name: 'Red Dragon', category: 'dragon', color: '#dc2626' },
-  { id: 'dg', symbol: '🀅', name: 'Green Dragon', category: 'dragon', color: '#16a34a' },
-  { id: 'dw', symbol: '🀆', name: 'White Dragon', category: 'dragon', color: '#2563eb' },
-  // Winds
-  { id: 'we', symbol: '🀀', name: 'East Wind', category: 'wind', color: '#d97706' },
-  { id: 'ws', symbol: '🀁', name: 'South Wind', category: 'wind', color: '#d97706' },
-  { id: 'ww', symbol: '🀂', name: 'West Wind', category: 'wind', color: '#d97706' },
-  { id: 'wn', symbol: '🀃', name: 'North Wind', category: 'wind', color: '#d97706' },
-  // Seasons & Flowers
-  { id: 'fl1', symbol: '🀢', name: 'Plum Blossom', category: 'flower', color: '#db2777' },
-  { id: 'fl2', symbol: '🀣', name: 'Orchid', category: 'flower', color: '#db2777' },
-  { id: 'fl3', symbol: '🀤', name: 'Bamboo Flower', category: 'flower', color: '#059669' },
-  { id: 'fl4', symbol: '🀥', name: 'Chrysanthemum', category: 'flower', color: '#ca8a04' },
+  // Circles / Dots (Tong) 1 through 9
+  { id: 'd1', symbol: 'd1', name: '1 Dot', category: 'circle', color: '#1d4ed8' },
+  { id: 'd2', symbol: 'd2', name: '2 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd3', symbol: 'd3', name: '3 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd4', symbol: 'd4', name: '4 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd5', symbol: 'd5', name: '5 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd6', symbol: 'd6', name: '6 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd7', symbol: 'd7', name: '7 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd8', symbol: 'd8', name: '8 Dots', category: 'circle', color: '#1d4ed8' },
+  { id: 'd9', symbol: 'd9', name: '9 Dots', category: 'circle', color: '#1d4ed8' },
+
+  // Bamboo (Tiao) 1 through 9
+  { id: 'b1', symbol: 'b1', name: '1 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b2', symbol: 'b2', name: '2 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b3', symbol: 'b3', name: '3 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b4', symbol: 'b4', name: '4 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b5', symbol: 'b5', name: '5 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b6', symbol: 'b6', name: '6 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b7', symbol: 'b7', name: '7 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b8', symbol: 'b8', name: '8 Bamboo', category: 'bamboo', color: '#047857' },
+  { id: 'b9', symbol: 'b9', name: '9 Bamboo', category: 'bamboo', color: '#047857' },
+
+  // Winds (East & South)
+  { id: 'we', symbol: 'we', name: 'East Wind', category: 'wind', color: '#1d4ed8' },
+  { id: 'ws', symbol: 'ws', name: 'South Wind', category: 'wind', color: '#dc2626' },
 ];

@@ -295,12 +295,26 @@ export const CheckersGame: React.FC<CheckersGameProps> = ({
   // Opponent dialogue timer
   const quoteTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
+  const recordedWinRef = useRef(false);
+
   // PvP sync
   useEffect(() => {
     if (pvpRoom && pvpRoom.game === 'checkers' && pvpRoom.state && Array.isArray(pvpRoom.state.board)) {
       setBoard(pvpRoom.state.board);
       setTurn(pvpRoom.state.turn ?? 'w');
-      if (pvpRoom.status === 'done') setGameOver(true);
+      if (pvpRoom.status === 'done') {
+        setGameOver(true);
+        if (
+          (pvpRoom.state.winner === mySide || pvpRoom.state.winner === user.uid) &&
+          !recordedWinRef.current
+        ) {
+          recordedWinRef.current = true;
+          const { user: updatedUser } = Backend.recordWin(user, 'checkers');
+          onUpdateUser(updatedUser);
+          setGameResult('win');
+          setStatusMessage('🎉 Victory! You won the checkers match!');
+        }
+      }
       setGameStarted(true);
     } else if (pvpRoom && pvpRoom.game === 'checkers' && !pvpRoom.state && pvpRoom.host === user.uid) {
       Backend.updateRoom({
@@ -310,7 +324,7 @@ export const CheckersGame: React.FC<CheckersGameProps> = ({
       });
       setGameStarted(true);
     }
-  }, [pvpRoom]);
+  }, [pvpRoom, mySide]);
 
   // Handle Level Selection (Levels 1 to 10)
   const handleSelectLevel = (lvl: number) => {
@@ -381,6 +395,14 @@ export const CheckersGame: React.FC<CheckersGameProps> = ({
     setGameResult('loss');
     setStatusMessage(`You resigned against ${selectedBot.name}.`);
     setBotQuote(selectedBot.dialogues.onWin);
+    if (pvpRoom) {
+      const oppSide = mySide === 'w' ? 'b' : 'w';
+      Backend.updateRoom({
+        ...pvpRoom,
+        state: { board, turn, winner: oppSide },
+        status: 'done',
+      });
+    }
   };
 
   // Handle Cell Click during gameplay
@@ -451,6 +473,7 @@ export const CheckersGame: React.FC<CheckersGameProps> = ({
     const oppMoves = getLegalMoves(nextBoard, nextTurn);
     if (oppMoves.length === 0) {
       setGameOver(true);
+      recordedWinRef.current = true;
       const { user: updatedUser } = Backend.recordWin(user, 'checkers');
       onUpdateUser(updatedUser);
       setGameResult('win');
@@ -460,7 +483,7 @@ export const CheckersGame: React.FC<CheckersGameProps> = ({
       if (pvpRoom) {
         Backend.updateRoom({
           ...pvpRoom,
-          state: { board: nextBoard, turn: nextTurn },
+          state: { board: nextBoard, turn: nextTurn, winner: mySide },
           status: 'done',
         });
       }

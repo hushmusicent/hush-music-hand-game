@@ -31,7 +31,7 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); /* CRITICAL: The app will break without this line */
 export const rtdb: Database = getDatabase(
   app,
-  firebaseConfig.databaseURL || 'https://project-556676b3-bbce-4e02-8ce-default-rtdb.firebaseio.com/'
+  (firebaseConfig as any).databaseURL || 'https://project-556676b3-bbce-4e02-8ce-default-rtdb.firebaseio.com/'
 );
 export const auth = getAuth(app);
 

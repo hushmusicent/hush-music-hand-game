@@ -6,12 +6,12 @@ export const DAILY_BONUS = 500;
 export const DAILY_INTERVAL_MS = 20 * 60 * 60 * 1000; // 20 hours
 
 export const CPU_PAYOUTS: Record<string, number> = {
-  checkers: 50,
-  chess: 100,
-  dominoes: 40,
-  spades: 60,
+  checkers: 250,
+  chess: 250,
+  dominoes: 250,
+  spades: 250,
   rummy: 60,
-  backgammon: 80,
+  backgammon: 250,
   mahjong: 40,
 };
 

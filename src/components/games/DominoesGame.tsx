@@ -492,9 +492,21 @@ export const DominoesGame: React.FC<DominoesGameProps> = ({
     };
   }, []);
 
+  const recordedWinRef = useRef(false);
+
   useEffect(() => {
     if (pvpRoom && pvpRoom.state) {
       setState(pvpRoom.state);
+      if (
+        pvpRoom.state.matchOver &&
+        pvpRoom.state.matchWinner === mySeat &&
+        !recordedWinRef.current
+      ) {
+        recordedWinRef.current = true;
+        const { user: updatedUser } = Backend.recordWin(user, 'dominoes');
+        onUpdateUser(updatedUser);
+        Sound.jackpot();
+      }
     } else if (pvpRoom && !pvpRoom.state && pvpRoom.host === user.uid) {
       Backend.updateRoom({
         ...pvpRoom,
@@ -502,7 +514,7 @@ export const DominoesGame: React.FC<DominoesGameProps> = ({
         turn: state.turn,
       });
     }
-  }, [pvpRoom]);
+  }, [pvpRoom, mySeat]);
 
   // Flash score banner when points by 5s are made
   useEffect(() => {
@@ -643,6 +655,7 @@ export const DominoesGame: React.FC<DominoesGameProps> = ({
 
     if (nextState.matchOver) {
       if (nextState.matchWinner === mySeat) {
+        recordedWinRef.current = true;
         const { user: updatedUser } = Backend.recordWin(user, 'dominoes');
         onUpdateUser(updatedUser);
         Sound.jackpot();

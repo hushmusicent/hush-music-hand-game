@@ -463,6 +463,8 @@ export const ChessGame: React.FC<ChessGameProps> = ({
 
   const botColor: PieceColor = myColor === 'w' ? 'b' : 'w';
 
+  const recordedWinRef = useRef(false);
+
   // Sync with PvP if active
   useEffect(() => {
     if (pvpRoom && pvpRoom.game === 'chess') {
@@ -470,7 +472,19 @@ export const ChessGame: React.FC<ChessGameProps> = ({
       if (pvpRoom.state && Array.isArray(pvpRoom.state.board)) {
         setBoard(pvpRoom.state.board);
         setTurn(pvpRoom.state.turn ?? 'w');
-        if (pvpRoom.status === 'done') setGameOver(true);
+        if (pvpRoom.status === 'done') {
+          setGameOver(true);
+          if (
+            (pvpRoom.state.winner === myColor || pvpRoom.state.winner === user.uid) &&
+            !recordedWinRef.current
+          ) {
+            recordedWinRef.current = true;
+            const { user: updatedUser } = Backend.recordWin(user, 'chess');
+            onUpdateUser(updatedUser);
+            setGameResult('win');
+            setStatusMessage('🎉 Victory! You won the chess match!');
+          }
+        }
       } else if (!pvpRoom.state && pvpRoom.host === user.uid) {
         Backend.updateRoom({
           ...pvpRoom,
@@ -479,7 +493,7 @@ export const ChessGame: React.FC<ChessGameProps> = ({
         });
       }
     }
-  }, [pvpRoom]);
+  }, [pvpRoom, myColor]);
 
   // Start the match from pre-game setup screen
   const handleStartMatch = () => {
@@ -570,6 +584,14 @@ export const ChessGame: React.FC<ChessGameProps> = ({
     setGameResult('loss');
     setStatusMessage(`You resigned. ${selectedBot.name} wins.`);
     setBotQuote(selectedBot.dialogues.onWin);
+    if (pvpRoom) {
+      const oppColor = myColor === 'w' ? 'b' : 'w';
+      Backend.updateRoom({
+        ...pvpRoom,
+        state: { board, turn, winner: oppColor },
+        status: 'done',
+      });
+    }
   };
 
   // Square click during active game
@@ -617,6 +639,7 @@ export const ChessGame: React.FC<ChessGameProps> = ({
       setGameOver(true);
       if (isOppInCheck) {
         // Human delivered checkmate!
+        recordedWinRef.current = true;
         const { user: updatedUser } = Backend.recordWin(user, 'chess');
         onUpdateUser(updatedUser);
         setGameResult('win');
@@ -632,7 +655,7 @@ export const ChessGame: React.FC<ChessGameProps> = ({
       if (pvpRoom) {
         Backend.updateRoom({
           ...pvpRoom,
-          state: { board: nextBoard, turn: nextTurn },
+          state: { board: nextBoard, turn: nextTurn, winner: isOppInCheck ? myColor : null },
           status: 'done',
         });
       }

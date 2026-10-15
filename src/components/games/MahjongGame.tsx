@@ -30,12 +30,14 @@ import {
 } from './mahjong/mahjongData';
 import { ALL_MAHJONG_DESIGNS } from './mahjong/allDesigns';
 import { MahjongDesignsModal } from './mahjong/MahjongDesignsModal';
+import { MahjongTileFace } from './mahjong/MahjongTileFace';
 
 interface MahjongTileInstance {
   id: number;
   x: number;
   y: number;
   z: number;
+  tileId?: string;
   symbol: string;
   name: string;
   category: string;
@@ -171,6 +173,7 @@ export const MahjongGame: React.FC<MahjongGameProps> = ({ user, onUpdateUser }) 
         x: pos.x,
         y: pos.y,
         z: pos.z,
+        tileId: tileDef.id,
         symbol: tileDef.symbol,
         name: tileDef.name,
         category: tileDef.category,
@@ -893,26 +896,15 @@ export const MahjongGame: React.FC<MahjongGameProps> = ({ user, onUpdateUser }) 
                       </span>
                     )}
 
-                    {/* Tile face symbol */}
-                    <span
-                      className="leading-none transition-transform pointer-events-none"
-                      style={{
-                        fontSize: `${Math.max(13, Math.round(adaptiveTileWidth * 0.54))}px`,
-                        color: free ? tile.color : undefined,
-                      }}
-                    >
-                      {tile.symbol}
-                    </span>
-
-                    {/* Micro subtext on larger sizes */}
-                    {adaptiveTileWidth >= 44 && (
-                      <span
-                        className="text-[8px] sm:text-[9px] font-semibold truncate max-w-full px-0.5 leading-tight opacity-75 mt-0.5 pointer-events-none"
-                        style={{ color: free ? '#334155' : undefined }}
-                      >
-                        {tile.name.split(' ')[0]}
-                      </span>
-                    )}
+                    {/* Real CSS-rendered Mahjong Tile Face */}
+                    <MahjongTileFace
+                      tileId={tile.tileId || tile.symbol}
+                      name={tile.name}
+                      category={tile.category}
+                      isFree={free}
+                      width={adaptiveTileWidth}
+                      height={adaptiveTileHeight}
+                    />
                   </button>
                 );
               })}
