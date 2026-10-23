@@ -11,6 +11,19 @@ service cloud.firestore {
       return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'username'])
+        && data.keys().hasOnly(['uid', 'username', 'email', 'points', 'wins', 'lastDaily', 'avatar', 'lastSeen'])
+        && data.uid is string && data.uid.size() <= 128
+        && data.username is string && data.username.size() <= 64
+        && (!('email' in data) || (data.email is string && data.email.size() <= 128))
+        && (!('points' in data) || data.points is number)
+        && (!('wins' in data) || data.wins is map)
+        && (!('lastDaily' in data) || data.lastDaily is number)
+        && (!('avatar' in data) || (data.avatar is string && data.avatar.size() <= 128))
+        && (!('lastSeen' in data) || data.lastSeen is number);
+    }
+
     function isValidRoom(data) {
       return data.keys().hasAll(['code', 'game', 'seatsNeeded', 'seats', 'host', 'status'])
         && data.keys().hasOnly(['code', 'game', 'seatsNeeded', 'seats', 'names', 'avatars', 'turn', 'status', 'host', 'created', 'state', 'updatedAt'])
@@ -33,6 +46,16 @@ service cloud.firestore {
       allow read, write: if isValidId(docId);
     }
 
+    // User profiles
+    match /users/{userId} {
+      allow get: if isValidId(userId);
+      allow list: if true;
+      allow create, update: if isValidId(userId)
+        && isValidUser(request.resource.data)
+        && request.resource.data.uid == userId;
+      allow delete: if isValidId(userId);
+    }
+
     // Multiplayer game rooms
     match /rooms/{roomId} {
       allow get: if isValidId(roomId);
@@ -43,6 +66,18 @@ service cloud.firestore {
       allow update: if isValidId(roomId)
         && isValidRoom(request.resource.data);
       allow delete: if isValidId(roomId);
+
+      // WebRTC voice signaling per player pair
+      match /voice_signals/{pairId} {
+        allow get, list: if isValidId(roomId);
+        allow create, update, delete: if isValidId(roomId) && isValidId(pairId);
+      }
+
+      // WebRTC voice presence per participant
+      match /voice_presence/{userId} {
+        allow get, list: if isValidId(roomId);
+        allow create, update, delete: if isValidId(roomId) && isValidId(userId);
+      }
     }
   }
 }

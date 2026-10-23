@@ -18,7 +18,8 @@ interface SpadesState {
   bids: (number | null)[];
   tricks: number[];
   trick: PlayedCard[];
-  leader: number;
+  handLeader?: number; // Starting leader/dealer for the hand, rotates clockwise each hand
+  leader: number;     // Leader of the current trick
   turn: number;
   phase: 'bid' | 'play';
   scores: number[];
@@ -27,7 +28,22 @@ interface SpadesState {
   over: boolean;
 }
 
-function initSpadesHand(): SpadesState {
+function computeBotBid(hand: Card[]): number {
+  let est = 0;
+  (hand || []).forEach((c) => {
+    if (c.s === '♠' && getRankValue(c.r) >= 11) est++;
+    if (c.r === 'A') est++;
+    if (c.s === '♠' && getRankValue(c.r) >= 14) est++;
+  });
+  return Math.max(1, Math.min(6, est || 1));
+}
+
+function initSpadesHand(
+  scores: number[] = [0, 0, 0, 0],
+  handNumber: number = 1,
+  handLeader?: number,
+  botSeatCheck?: (seatIdx: number) => boolean
+): SpadesState {
   const deck = createDeck();
   const hands: Card[][] = [[], [], [], []];
   for (let i = 0; i < 13; i++) {
@@ -45,16 +61,27 @@ function initSpadesHand(): SpadesState {
     });
   });
 
+  const nextHandLeader = typeof handLeader === 'number' ? handLeader : (handNumber - 1) % 4;
+  const bids: (number | null)[] = [null, null, null, null];
+  if (botSeatCheck) {
+    for (let s = 0; s < 4; s++) {
+      if (botSeatCheck(s)) {
+        bids[s] = computeBotBid(hands[s]);
+      }
+    }
+  }
+
   return {
     hands,
-    bids: [null, null, null, null],
+    bids,
     tricks: [0, 0, 0, 0],
     trick: [],
-    leader: 0,
-    turn: 0,
+    handLeader: nextHandLeader,
+    leader: nextHandLeader,
+    turn: nextHandLeader,
     phase: 'bid',
-    scores: [0, 0, 0, 0],
-    handNumber: 1,
+    scores: [...scores],
+    handNumber,
     broken: false,
     over: false,
   };
@@ -85,10 +112,6 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
   onUpdateUser,
   pvpRoom,
 }) => {
-  const [state, setState] = useState<SpadesState>(initSpadesHand);
-  const [message, setMessage] = useState('Bidding Phase — place your trick bid');
-  const { participants: voiceParticipants } = useVoiceChat(pvpRoom ?? null, user);
-
   // Robust seat index lookup for user across potential prefix/suffix variations
   const mySeat = (() => {
     if (!pvpRoom?.seats || !Array.isArray(pvpRoom.seats)) return 0;
@@ -118,21 +141,35 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
     return clean(pvpRoom.host) === targetUid ? 0 : 1;
   })();
 
-  const isMyTurn = !state?.over && state?.turn === mySeat;
-
-  const isBotSeat = (seatIdx: number) => {
-    if (!pvpRoom || !pvpRoom.seats) return seatIdx !== 0;
-    // In PvP Spades (2 human players table):
-    // Seat 0 is Host (human)
-    if (seatIdx === 0) return false;
-    // Seat 1 is Opponent (human unless explicit test bot)
-    if (seatIdx === 1) {
-      const p2 = pvpRoom.seats[1];
-      return typeof p2 === 'string' && p2.startsWith('bot_');
+  const isBotSeat = (seatIdx: number): boolean => {
+    if (!pvpRoom || !pvpRoom.seats || !Array.isArray(pvpRoom.seats)) {
+      // In Solo / Vs Bot mode, any seat other than mySeat is a bot
+      return seatIdx !== mySeat;
     }
-    // Seats 2 and 3 are always bots
-    return true;
+    // In PvP mode, human player sitting at this client is never a bot
+    if (seatIdx === mySeat) return false;
+
+    const seatOccupant = pvpRoom.seats[seatIdx];
+    // If seat has no assigned player (e.g. seats 2 and 3 in a 2-player room), it is a bot
+    if (!seatOccupant) return true;
+
+    // If assigned player is a bot or test opponent
+    if (
+      typeof seatOccupant === 'string' &&
+      (seatOccupant.startsWith('bot_') || seatOccupant.includes('_p2') || seatOccupant.includes('test'))
+    ) {
+      return true;
+    }
+
+    // Real human opponent
+    return false;
   };
+
+  const [state, setState] = useState<SpadesState>(() => initSpadesHand([0, 0, 0, 0], 1, 0, isBotSeat));
+  const [message, setMessage] = useState('Bidding Phase — place your trick bid');
+  const { participants: voiceParticipants } = useVoiceChat(pvpRoom ?? null, user);
+
+  const isMyTurn = !state?.over && state?.turn === mySeat;
 
   const normalizeBids = (raw: any): (number | null)[] => {
     if (!raw) return [null, null, null, null];
@@ -143,6 +180,7 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
   };
 
   const recordedWinRef = useRef(false);
+  const botTurnRunningRef = useRef(false);
 
   useEffect(() => {
     if (pvpRoom && pvpRoom.game === 'spades' && pvpRoom.state) {
@@ -152,6 +190,7 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
         bids: normalizeBids(s.bids),
         tricks: Array.isArray(s.tricks) ? s.tricks : [0, 0, 0, 0],
         trick: Array.isArray(s.trick) ? s.trick : [],
+        handLeader: typeof s.handLeader === 'number' ? s.handLeader : (typeof s.handNumber === 'number' ? (s.handNumber - 1) % 4 : 0),
         leader: typeof s.leader === 'number' ? s.leader : 0,
         turn: typeof s.turn === 'number' ? s.turn : 0,
         phase: s.phase === 'play' ? 'play' : 'bid',
@@ -214,45 +253,44 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
     }, delay);
 
     return () => clearTimeout(timer);
-  }, [state.phase, state.turn, state.trick?.length, state.over, pvpRoom?.host, user.uid]);
+  }, [state.phase, state.turn, state.trick?.length, state.over, pvpRoom?.host, user.uid, mySeat]);
 
-  // Ensure bot bids are auto-filled promptly when host is active
+  // Ensure bot bids are auto-filled promptly in both Vs Bot and Online PvP modes
+  // Does NOT assume seat 0 is human, works for any seat mySeat is in!
   useEffect(() => {
-    if (state.phase === 'bid' && !state.over) {
-      const isHost = !pvpRoom || pvpRoom.host === user.uid;
-      if (!isHost) return;
-      const bids = normalizeBids(state.bids);
-      const hasMissingBotBids = [2, 3].some((s) => isBotSeat(s) && bids[s] === null);
-      if (hasMissingBotBids && bids[0] !== null) {
-        const nextBids = [...bids];
-        for (let s = 0; s < 4; s++) {
-          if (nextBids[s] === null && isBotSeat(s)) {
-            let est = 0;
-            (safeHands[s] || []).forEach((c) => {
-              if (c.s === '♠' && getRankValue(c.r) >= 11) est++;
-              if (c.r === 'A') est++;
-            });
-            nextBids[s] = Math.max(1, Math.min(6, est));
-          }
-        }
-        const allPlaced = nextBids.every((b) => typeof b === 'number');
-        const nextState: SpadesState = {
-          ...state,
-          bids: nextBids,
-          phase: allPlaced ? 'play' : 'bid',
-          turn: allPlaced ? state.leader : state.turn,
-        };
-        setState(nextState);
-        if (pvpRoom) {
-          Backend.updateRoom({
-            ...pvpRoom,
-            state: nextState,
-            turn: nextState.turn,
-          });
-        }
+    if (state.phase !== 'bid' || state.over) return;
+    const isHost = !pvpRoom || pvpRoom.host === user.uid;
+    if (!isHost) return;
+
+    const bids = normalizeBids(state.bids);
+    const missingBotSeats = [0, 1, 2, 3].filter((s) => isBotSeat(s) && bids[s] === null);
+
+    if (missingBotSeats.length > 0) {
+      const nextBids = [...bids];
+      for (const s of missingBotSeats) {
+        nextBids[s] = computeBotBid(safeHands[s] || []);
+      }
+      const allPlaced = nextBids.every((b) => typeof b === 'number');
+      const leaderSeat = typeof state.handLeader === 'number' ? state.handLeader : state.leader;
+      const nextState: SpadesState = {
+        ...state,
+        bids: nextBids,
+        phase: allPlaced ? 'play' : 'bid',
+        turn: allPlaced ? leaderSeat : state.turn,
+      };
+      setState(nextState);
+      if (pvpRoom) {
+        Backend.updateRoom({
+          ...pvpRoom,
+          state: nextState,
+          turn: nextState.turn,
+        });
+      }
+      if (allPlaced && isBotSeat(leaderSeat) && (!pvpRoom || pvpRoom.host === user.uid)) {
+        setTimeout(() => executeBotTurn(nextState), 220);
       }
     }
-  }, [state.phase, state.bids, state.over, pvpRoom?.host, user.uid]);
+  }, [state.phase, state.bids, state.over, pvpRoom?.host, user.uid, mySeat]);
 
   const handlePlaceBid = (bid: number) => {
     if (state.phase !== 'bid' || safeBids[mySeat] !== null) return;
@@ -261,31 +299,28 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
     const nextBids = [...safeBids];
     nextBids[mySeat] = bid;
 
-    // Fill bot bids only for actual bot seats (seats 2 and 3, or seat 1 if test bot)
+    // Fill bot bids for any bot seats that haven't bid yet
     for (let s = 0; s < 4; s++) {
       if (nextBids[s] === null && isBotSeat(s)) {
-        let est = 0;
-        (safeHands[s] || []).forEach((c) => {
-          if (c.s === '♠' && getRankValue(c.r) >= 11) est++;
-          if (c.r === 'A') est++;
-        });
-        nextBids[s] = Math.max(1, Math.min(6, est));
+        nextBids[s] = computeBotBid(safeHands[s] || []);
       }
     }
 
     const allPlaced = nextBids.every((b) => typeof b === 'number');
     const nextPhase = allPlaced ? 'play' : 'bid';
+    const leaderSeat = typeof state.handLeader === 'number' ? state.handLeader : state.leader;
 
     const nextState: SpadesState = {
       ...state,
       bids: nextBids,
       phase: nextPhase,
-      turn: allPlaced ? state.leader : state.turn,
+      turn: allPlaced ? leaderSeat : state.turn,
     };
 
     setState(nextState);
     if (allPlaced) {
-      setMessage(`Bids placed! Lead your card.`);
+      const leaderInfo = getPlayerInfo(leaderSeat);
+      setMessage(leaderSeat === mySeat ? 'Bids placed! Lead your card.' : `Bids placed! ${leaderInfo.name} has the lead.`);
     } else {
       setMessage(`Your bid placed (${bid}). Waiting for other player to bid...`);
     }
@@ -298,7 +333,7 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
       });
     }
 
-    if (allPlaced && isBotSeat(nextState.turn) && (!pvpRoom || pvpRoom.host === user.uid)) {
+    if (allPlaced && isBotSeat(leaderSeat) && (!pvpRoom || pvpRoom.host === user.uid)) {
       setTimeout(() => executeBotTurn(nextState), 220);
     }
   };
@@ -378,69 +413,75 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
   };
 
   const executeBotTurn = (s: SpadesState) => {
-    const curHand = s.hands?.[s.turn] || [];
-    if (curHand.length === 0) return;
-    const ledSuit = s.trick && s.trick.length > 0 ? s.trick[0].card.s : null;
+    if (botTurnRunningRef.current) return;
+    botTurnRunningRef.current = true;
+    try {
+      const curHand = s.hands?.[s.turn] || [];
+      if (curHand.length === 0) return;
+      const ledSuit = s.trick && s.trick.length > 0 ? s.trick[0].card.s : null;
 
-    let playableCards = curHand;
-    if (!ledSuit) {
-      // Leading
-      playableCards = curHand.filter((c) => c.s !== '♠' || s.broken);
-      if (playableCards.length === 0) playableCards = curHand;
-    } else {
-      const follow = curHand.filter((c) => c.s === ledSuit);
-      if (follow.length > 0) playableCards = follow;
-    }
-
-    // Pick a card
-    const chosen = playableCards[0] || curHand[0];
-    const chosenIdx = curHand.indexOf(chosen);
-
-    const nextHands = s.hands.map((h) => [...h]);
-    nextHands[s.turn].splice(chosenIdx, 1);
-
-    const isBroken = s.broken || chosen.s === '♠';
-    const nextTrick = [...(s.trick || []), { seat: s.turn, card: chosen }];
-    Sound.cardDeal();
-
-    if (nextTrick.length === 4) {
-      const interimState: SpadesState = {
-        ...s,
-        hands: nextHands,
-        trick: nextTrick,
-        broken: isBroken,
-      };
-      setState(interimState);
-      if (pvpRoom) {
-        Backend.updateRoom({
-          ...pvpRoom,
-          state: interimState,
-          turn: -1,
-        });
+      let playableCards = curHand;
+      if (!ledSuit) {
+        // Leading
+        playableCards = curHand.filter((c) => c.s !== '♠' || s.broken);
+        if (playableCards.length === 0) playableCards = curHand;
+      } else {
+        const follow = curHand.filter((c) => c.s === ledSuit);
+        if (follow.length > 0) playableCards = follow;
       }
-      setTimeout(() => {
-        resolveCompletedTrick(nextHands, nextTrick, isBroken, interimState);
-      }, 550);
-    } else {
-      const nextTurn = (s.turn + 1) % 4;
-      const nextState: SpadesState = {
-        ...s,
-        hands: nextHands,
-        trick: nextTrick,
-        broken: isBroken,
-        turn: nextTurn,
-      };
-      setState(nextState);
-      if (pvpRoom) {
-        Backend.updateRoom({
-          ...pvpRoom,
-          state: nextState,
+
+      // Pick a card
+      const chosen = playableCards[0] || curHand[0];
+      const chosenIdx = curHand.indexOf(chosen);
+
+      const nextHands = s.hands.map((h) => [...h]);
+      nextHands[s.turn].splice(chosenIdx, 1);
+
+      const isBroken = s.broken || chosen.s === '♠';
+      const nextTrick = [...(s.trick || []), { seat: s.turn, card: chosen }];
+      Sound.cardDeal();
+
+      if (nextTrick.length === 4) {
+        const interimState: SpadesState = {
+          ...s,
+          hands: nextHands,
+          trick: nextTrick,
+          broken: isBroken,
+        };
+        setState(interimState);
+        if (pvpRoom) {
+          Backend.updateRoom({
+            ...pvpRoom,
+            state: interimState,
+            turn: -1,
+          });
+        }
+        setTimeout(() => {
+          resolveCompletedTrick(nextHands, nextTrick, isBroken, interimState);
+        }, 550);
+      } else {
+        const nextTurn = (s.turn + 1) % 4;
+        const nextState: SpadesState = {
+          ...s,
+          hands: nextHands,
+          trick: nextTrick,
+          broken: isBroken,
           turn: nextTurn,
-        });
+        };
+        setState(nextState);
+        if (pvpRoom) {
+          Backend.updateRoom({
+            ...pvpRoom,
+            state: nextState,
+            turn: nextTurn,
+          });
+        }
+        if (isBotSeat(nextTurn) && (!pvpRoom || pvpRoom.host === user.uid)) {
+          setTimeout(() => executeBotTurn(nextState), 220);
+        }
       }
-      if (isBotSeat(nextTurn) && (!pvpRoom || pvpRoom.host === user.uid)) {
-        setTimeout(() => executeBotTurn(nextState), 220);
-      }
+    } finally {
+      botTurnRunningRef.current = false;
     }
   };
 
@@ -457,13 +498,19 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
     const nextTricks = [...prevTricks];
     nextTricks[winnerSeat]++;
 
-    const isHandComplete = hands[0]?.length === 0;
+    // A hand is complete when all cards from all hands have been played
+    const isHandComplete = hands.every((h) => !h || h.length === 0);
 
     if (isHandComplete) {
-      // Calculate hand scores
-      const nextScores = [...safeScores];
+      // Calculate hand scores using the scores and bids from the completed hand
+      const safeScoresAtEnd = Array.isArray(prevState?.scores || state?.scores)
+        ? [...(prevState?.scores || state.scores)]
+        : [0, 0, 0, 0];
+      const safeBidsAtEnd = normalizeBids(prevState?.bids || state?.bids);
+
+      const nextScores = [...safeScoresAtEnd];
       for (let s = 0; s < 4; s++) {
-        const bid = safeBids[s] || 1;
+        const bid = safeBidsAtEnd[s] || 1;
         const won = nextTricks[s];
         if (won >= bid) {
           nextScores[s] += bid * 10 + (won - bid);
@@ -502,11 +549,14 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
           });
         }
       } else {
-        const fresh = initSpadesHand();
-        fresh.scores = nextScores;
-        fresh.handNumber = (state.handNumber || 1) + 1;
-        fresh.leader = (state.leader + 1) % 4;
-        fresh.turn = fresh.leader;
+        // Automatically deal hand N+1 with scores carried over!
+        // The hand leader rotates clockwise: Hand 1 -> 0, Hand 2 -> 1, Hand 3 -> 2, Hand 4 -> 3
+        const prevHandNum = (prevState?.handNumber ?? state.handNumber) || 1;
+        const nextHandNumber = prevHandNum + 1;
+        const nextHandLeader = (nextHandNumber - 1) % 4;
+
+        const fresh = initSpadesHand(nextScores, nextHandNumber, nextHandLeader, isBotSeat);
+
         setState(fresh);
         if (pvpRoom) {
           Backend.updateRoom({
@@ -515,7 +565,10 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
             turn: fresh.turn,
           });
         }
-        setMessage(`Hand finished. Dealing hand #${fresh.handNumber}... Place your trick bid.`);
+        const leaderInfo = getPlayerInfo(nextHandLeader);
+        setMessage(
+          `Hand #${prevHandNum} finished! Dealing hand #${fresh.handNumber}... Scores carried over. ${leaderInfo.name} has the lead.`
+        );
       }
     } else {
       const nextState: SpadesState = {
@@ -550,19 +603,21 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
       return {
         name: (pvpRoom.names && pvpRoom.names[uid]) || `Player ${s + 1}`,
         avatar: pvpRoom.avatars?.[uid] || (uid === user.uid ? user.avatar : undefined),
-        isRobot: typeof uid === 'string' && uid.startsWith('bot_'),
+        isRobot:
+          typeof uid === 'string' &&
+          (uid.startsWith('bot_') || uid.includes('_p2') || uid.includes('test')),
       };
     }
-    if (s === 0) {
+    if (s === mySeat) {
       return {
         name: user.username,
         avatar: user.avatar,
         isRobot: false,
       };
     }
-    const botNames = ['', 'East Bot', 'North Bot', 'West Bot'];
+    const botNames = ['South Bot', 'East Bot', 'North Bot', 'West Bot'];
     return {
-      name: botNames[s] || `Bot ${s}`,
+      name: botNames[s] || `Bot ${s + 1}`,
       avatar: undefined,
       isRobot: true,
     };
@@ -572,13 +627,22 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
   if (!state.over) {
     if (state.phase === 'bid') {
       if (safeBids[mySeat] === null || safeBids[mySeat] === undefined) {
-        displayMessage = 'Bidding Phase — Select your trick bid (1 - 6)';
+        displayMessage = `Hand #${state.handNumber || 1} Bidding — Select your trick bid (1 - 6)`;
       } else {
-        displayMessage = `Your bid placed (${safeBids[mySeat]}). Waiting for opponent to bid...`;
+        const remainingHumans = [0, 1, 2, 3].filter((s) => !isBotSeat(s) && safeBids[s] === null);
+        if (remainingHumans.length > 0) {
+          const names = remainingHumans.map((s) => getPlayerInfo(s).name).join(', ');
+          displayMessage = `Your bid placed (${safeBids[mySeat]}). Waiting for ${names} to bid...`;
+        } else {
+          displayMessage = `Your bid placed (${safeBids[mySeat]}). Starting play...`;
+        }
       }
     } else if (state.phase === 'play') {
       if (isMyTurn) {
-        displayMessage = safeTrick.length === 0 ? 'Your lead! Select a card to play.' : 'Your turn! Follow suit if possible.';
+        displayMessage =
+          safeTrick.length === 0
+            ? 'Your lead! Select a card to play.'
+            : 'Your turn! Follow suit if possible.';
       } else {
         const turnInfo = getPlayerInfo(state.turn);
         displayMessage = `Waiting for ${turnInfo.name} to play...`;
@@ -589,6 +653,19 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
   return (
     <div className="max-w-md mx-auto space-y-4">
       <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-2xl space-y-4">
+        {/* Hand & Match Status Header */}
+        <div className="flex items-center justify-between text-[11px] px-1 text-slate-400 font-semibold border-b border-slate-800/80 pb-2">
+          <div className="flex items-center gap-1.5">
+            <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 font-bold border border-amber-500/30">
+              Hand #{state.handNumber || 1}
+            </span>
+            <span>Target: 250 pts</span>
+          </div>
+          <span className={state.broken ? 'text-amber-400 font-bold' : 'text-slate-500'}>
+            Spades {state.broken ? 'Broken ♠' : 'Unbroken'}
+          </span>
+        </div>
+
         {/* Scoreboard */}
         <div className="grid grid-cols-4 gap-1.5 bg-slate-950 p-2 rounded-xl border border-slate-800 text-center">
           {[0, 1, 2, 3].map((s) => {
@@ -623,7 +700,10 @@ export const SpadesGame: React.FC<SpadesGameProps> = ({
                   Bid: {safeBids[s] ?? '-'} | {safeTricks[s] ?? 0}
                 </span>
                 {s !== mySeat && (
-                  <div className="flex items-center gap-1 mt-1 text-[10px] text-amber-400/80 font-bold" title={`${safeHands[s]?.length || 0} cards in hand`}>
+                  <div
+                    className="flex items-center gap-1 mt-1 text-[10px] text-amber-400/80 font-bold"
+                    title={`${safeHands[s]?.length || 0} cards in hand`}
+                  >
                     <CardComponent hidden small className="w-4 h-5.5 p-0! pointer-events-none" />
                     <span>{safeHands[s]?.length || 0}</span>
                   </div>

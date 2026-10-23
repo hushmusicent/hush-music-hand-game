@@ -36,29 +36,17 @@ export interface FirebaseConfig {
   appId: string;
 }
 
-export interface LiveKitConfig {
-  url: string;
-  apiKey: string;
-  apiSecret: string;
-}
-
 export interface SystemConfig {
   firebase: FirebaseConfig;
-  livekit: LiveKitConfig;
 }
 
 const DEFAULT_CONFIG: SystemConfig = {
   firebase: {
     apiKey: 'AIzaSyAhT_oPTtMTlUvHaSOf7zWvnUwTGyJf4sk',
     authDomain: 'project-556676b3-bbce-4e02-8ce.firebaseapp.com',
-    databaseURL: 'https://project-556676b3-bbce-4e02-8ce-default-rtdb.firebaseio.com/',
+    databaseURL: '',
     projectId: 'project-556676b3-bbce-4e02-8ce',
     appId: '1:1043689485585:web:a96258740de6856c5f88b0',
-  },
-  livekit: {
-    url: '',
-    apiKey: '',
-    apiSecret: '',
   },
 };
 
@@ -72,14 +60,9 @@ export const Backend = {
           firebase: {
             apiKey: parsed.firebase?.apiKey?.trim() || DEFAULT_CONFIG.firebase.apiKey,
             authDomain: parsed.firebase?.authDomain?.trim() || DEFAULT_CONFIG.firebase.authDomain,
-            databaseURL: parsed.firebase?.databaseURL?.trim() || DEFAULT_CONFIG.firebase.databaseURL,
+            databaseURL: parsed.firebase?.databaseURL?.trim() || '',
             projectId: parsed.firebase?.projectId?.trim() || DEFAULT_CONFIG.firebase.projectId,
             appId: parsed.firebase?.appId?.trim() || DEFAULT_CONFIG.firebase.appId,
-          },
-          livekit: {
-            url: parsed.livekit?.url || DEFAULT_CONFIG.livekit.url,
-            apiKey: parsed.livekit?.apiKey || DEFAULT_CONFIG.livekit.apiKey,
-            apiSecret: parsed.livekit?.apiSecret || DEFAULT_CONFIG.livekit.apiSecret,
           },
         };
       }
@@ -95,12 +78,7 @@ export const Backend = {
 
   isFirebaseConfigured(): boolean {
     const cfg = this.getConfig().firebase;
-    return !!(cfg.apiKey && cfg.databaseURL && cfg.projectId);
-  },
-
-  isLiveKitConfigured(): boolean {
-    const cfg = this.getConfig().livekit;
-    return !!(cfg.url && cfg.apiKey && cfg.apiSecret);
+    return !!(cfg.apiKey && cfg.projectId);
   },
 
   // Auth Operations

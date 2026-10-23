@@ -40,12 +40,12 @@ try {
   if (fs.existsSync(configFile)) {
     const firebaseConfig = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
     const fbApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
-    firestoreDb = getFirestore(fbApp, firebaseConfig.firestoreDatabaseId);
-    rtdb = getDatabase(
-      fbApp,
-      firebaseConfig.databaseURL || 'https://project-556676b3-bbce-4e02-8ce-default-rtdb.firebaseio.com/'
-    );
-    console.log('Firebase Realtime Database & Firestore successfully initialized on backend server!');
+    const rtdbUrl = firebaseConfig.databaseURL;
+    if (typeof rtdbUrl === 'string' && rtdbUrl.trim().length > 0 && !rtdbUrl.includes('default-rtdb')) {
+      rtdb = getDatabase(fbApp, rtdbUrl.trim());
+      console.log('Firebase Realtime Database initialized on backend server!');
+    }
+    console.log('Firebase Firestore successfully initialized on backend server!');
   }
 } catch (err) {
   console.warn('Could not initialize Firebase in server:', err);
@@ -212,27 +212,45 @@ async function deleteRoomFromFirestore(code: string) {
   }
 }
 
-// Player / User Realtime Database Sync
+// Player / User Firestore & Realtime Database Sync
 async function syncPlayerToRTDB(player: any) {
-  if (!rtdb || !player || !player.uid) return;
+  if (!player || !player.uid) return;
   // Guard against recreating permanently erased KingVeno account
   const cleanName = (player.username || '').toLowerCase().trim();
   if (player.uid === 'u_zbs0jd0' || cleanName === 'kingveno') {
     return;
   }
-  try {
-    const safe = sanitizeUser(player);
-    await Promise.all([
-      rtdbSet(rtdbRef(rtdb, `players/${player.uid}`), safe),
-      rtdbSet(rtdbRef(rtdb, `users/${player.uid}`), safe),
-    ]);
-  } catch (err) {
-    console.warn('Error syncing player to RTDB:', err);
+  // 1. Primary sync to Firestore
+  if (firestoreDb) {
+    try {
+      const safe = sanitizeUser(player);
+      await setDoc(doc(firestoreDb, 'users', player.uid), safe);
+    } catch {
+      // Non-blocking fallback
+    }
+  }
+  // 2. Optional sync to RTDB if configured
+  if (rtdb) {
+    try {
+      const safe = sanitizeUser(player);
+      await Promise.all([
+        rtdbSet(rtdbRef(rtdb, `players/${player.uid}`), safe),
+        rtdbSet(rtdbRef(rtdb, `users/${player.uid}`), safe),
+      ]);
+    } catch {
+      // Non-blocking fallback
+    }
   }
 }
 
 async function deletePlayerFromRTDB(uid: string) {
-  if (!rtdb || !uid) return;
+  if (!uid) return;
+  if (firestoreDb) {
+    try {
+      await deleteDoc(doc(firestoreDb, 'users', uid));
+    } catch {}
+  }
+  if (!rtdb) return;
   try {
     await Promise.all([
       rtdbRemove(rtdbRef(rtdb, `players/${uid}`)),
@@ -241,8 +259,8 @@ async function deletePlayerFromRTDB(uid: string) {
       rtdbRemove(rtdbRef(rtdb, `sentRequests/${uid}`)),
       rtdbRemove(rtdbRef(rtdb, `friends/${uid}`)),
     ]);
-  } catch (err) {
-    console.warn('Error deleting player from RTDB:', err);
+  } catch {
+    // Non-blocking fallback
   }
 }
 
@@ -411,15 +429,18 @@ function loadStore() {
       });
   }
 
-  // Sync initial state (players, friends, requests) to Firebase Realtime Database
+  // Sync initial state (players and rooms) to Firebase Firestore
   setTimeout(() => {
+    if (firestoreDb) {
+      for (const u of users.values()) syncPlayerToRTDB(u).catch(() => {});
+      for (const r of rooms.values()) syncRoomToFirestore(r).catch(() => {});
+    }
     if (rtdb) {
       for (const u of users.values()) syncPlayerToRTDB(u).catch(() => {});
       for (const [uid, fset] of friendsMap.entries()) syncFriendsToRTDB(uid, Array.from(fset)).catch(() => {});
       for (const [targetUid, reqs] of requestsMap.entries()) {
         for (const r of reqs) syncFriendRequestToRTDB(targetUid, r).catch(() => {});
       }
-      for (const r of rooms.values()) syncRoomToFirestore(r).catch(() => {});
       console.log('Synchronized players and rooms to Firebase Realtime Database.');
     }
   }, 1000);

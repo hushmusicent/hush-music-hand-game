@@ -107,6 +107,26 @@
       "uid": "u_tester2",
       "username": "TESTER2",
       "wins": {}
+    },
+    "guest_mvkk3w9n_6441": {
+      "uid": "guest_mvkk3w9n_6441",
+      "username": "HushPlayer_6441",
+      "email": "player_6441@hushmusic.internal",
+      "points": 1000,
+      "wins": {},
+      "lastDaily": 0,
+      "avatar": "🎮",
+      "lastSeen": 1792734960155
+    },
+    "guest_mvkkarom_4536": {
+      "uid": "guest_mvkkarom_4536",
+      "username": "HushPlayer_4536",
+      "email": "player_4536@hushmusic.internal",
+      "points": 1000,
+      "wins": {},
+      "lastDaily": 0,
+      "avatar": "🎧",
+      "lastSeen": 1792735280806
     }
   },
   "chat": {},

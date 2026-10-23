@@ -29,10 +29,14 @@ import { Room, GameId, User, FriendRequest, ChatMessage } from './types';
 // Initialize Firebase App & Services
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId); /* CRITICAL: The app will break without this line */
-export const rtdb: Database = getDatabase(
-  app,
-  (firebaseConfig as any).databaseURL || 'https://project-556676b3-bbce-4e02-8ce-default-rtdb.firebaseio.com/'
-);
+
+// Only initialize Realtime Database if a valid databaseURL is explicitly configured in firebase-applet-config.json
+const rawRtdbUrl = (firebaseConfig as any).databaseURL;
+export const rtdb: Database | null =
+  typeof rawRtdbUrl === 'string' && rawRtdbUrl.trim().length > 0 && !rawRtdbUrl.includes('default-rtdb')
+    ? getDatabase(app, rawRtdbUrl.trim())
+    : null;
+
 export const auth = getAuth(app);
 
 // Error handling types & helpers per specification
@@ -84,22 +88,17 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Connection validation on initial boot
+// Connection validation on initial boot per Firebase integration skill
 export async function testConnection(): Promise<boolean> {
   try {
-    const testRef = rtdbRef(rtdb, '_test_boot');
-    await rtdbSet(testRef, { bootTime: Date.now(), status: 'online' });
-    console.log('Firebase Realtime Database connected successfully!');
+    await getDocFromServer(doc(db, 'test', 'connection'));
+    console.log('Firebase Firestore connected successfully!');
     return true;
-  } catch (rtdbErr) {
-    console.warn('Firebase RTDB boot notice:', rtdbErr);
-    try {
-      await getDocFromServer(doc(db, 'test', 'connection'));
-      return true;
-    } catch (error) {
-      console.warn('Firestore test connection notice:', error);
-      return false;
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('the client is offline')) {
+      console.error('Please check your Firebase configuration.');
     }
+    return false;
   }
 }
 
@@ -107,9 +106,9 @@ export async function testConnection(): Promise<boolean> {
 testConnection().catch(() => {});
 
 // ==========================================
-// 1. PLAYERS / USERS (Realtime Database)
+// 1. PLAYERS / USERS (Firestore Primary)
 // ==========================================
-export async function savePlayerToRTDB(player: User): Promise<void> {
+export async function savePlayerToFirestore(player: User): Promise<void> {
   if (!player || !player.uid) return;
   // Guard against recreating permanently erased KingVeno account
   const cleanName = (player.username || '').toLowerCase().trim();
@@ -141,179 +140,173 @@ export async function savePlayerToRTDB(player: User): Promise<void> {
   delete payload.passwordSalt;
 
   try {
-    // Write to both /players and /users so it's prominent in Firebase Data console
-    await Promise.all([
-      rtdbSet(rtdbRef(rtdb, `players/${player.uid}`), payload),
-      rtdbSet(rtdbRef(rtdb, `users/${player.uid}`), payload),
-    ]);
+    await setDoc(doc(db, 'users', player.uid), payload);
   } catch (err) {
-    console.error('Error writing player to Realtime Database:', err);
+    // Non-blocking fallback
+  }
+
+  if (rtdb) {
+    try {
+      await Promise.all([
+        rtdbSet(rtdbRef(rtdb, `players/${player.uid}`), payload),
+        rtdbSet(rtdbRef(rtdb, `users/${player.uid}`), payload),
+      ]);
+    } catch {
+      // Non-blocking fallback
+    }
   }
 }
+export const savePlayerToRTDB = savePlayerToFirestore;
 
-export async function getPlayerFromRTDB(uid: string): Promise<User | null> {
+export async function getPlayerFromFirestore(uid: string): Promise<User | null> {
   if (!uid) return null;
   try {
-    let raw: any = null;
-    const snap = await rtdbGet(rtdbRef(rtdb, `players/${uid}`));
+    const snap = await getDoc(doc(db, 'users', uid));
     if (snap.exists()) {
-      raw = snap.val();
-    } else {
-      const userSnap = await rtdbGet(rtdbRef(rtdb, `users/${uid}`));
-      if (userSnap.exists()) {
-        raw = userSnap.val();
-      }
+      const raw = snap.data();
+      const { password, passwordHash, passwordSalt, ...safeUser } = raw as any;
+      return safeUser as User;
     }
-    if (!raw) return null;
-    // Never return the password, passwordHash, or passwordSalt field when reading player data
-    const { password, passwordHash, passwordSalt, ...safeUser } = raw;
-    return safeUser as User;
-  } catch (err) {
-    console.warn('Error reading player from Realtime Database:', err);
-    return null;
+  } catch {
+    // Non-blocking
   }
-}
-
-export async function getAllPlayersFromRTDB(): Promise<User[]> {
-  try {
-    const snap = await rtdbGet(rtdbRef(rtdb, 'players'));
-    let rawList: any[] = [];
-    if (!snap.exists()) {
-      const uSnap = await rtdbGet(rtdbRef(rtdb, 'users'));
-      if (uSnap.exists()) {
-        rawList = Object.values((uSnap.val() || {}) as Record<string, any>);
+  if (rtdb) {
+    try {
+      const snap = await rtdbGet(rtdbRef(rtdb, `users/${uid}`));
+      if (snap.exists()) {
+        const raw = snap.val();
+        const { password, passwordHash, passwordSalt, ...safeUser } = raw as any;
+        return safeUser as User;
       }
-    } else {
-      rawList = Object.values((snap.val() || {}) as Record<string, any>);
+    } catch {
+      // Non-blocking
     }
-    return rawList
-      .filter(
-        (u) =>
-          u &&
-          u.uid !== 'u_zbs0jd0' &&
-          u.username?.toLowerCase() !== 'kingveno'
-      )
-      .map((u) => {
-        // Never return password fields when reading player data
+  }
+  return null;
+}
+export const getPlayerFromRTDB = getPlayerFromFirestore;
+
+export async function getAllPlayersFromFirestore(): Promise<User[]> {
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    return snap.docs
+      .map((d) => d.data())
+      .filter((u: any) => u && u.uid !== 'u_zbs0jd0' && u.username?.toLowerCase() !== 'kingveno')
+      .map((u: any) => {
         const { password, passwordHash, passwordSalt, ...safeUser } = u;
         return safeUser as User;
       });
-  } catch (err) {
-    console.warn('Error fetching all players from Realtime Database:', err);
+  } catch {
     return [];
   }
 }
+export const getAllPlayersFromRTDB = getAllPlayersFromFirestore;
 
-export async function deletePlayerFromRTDB(uid: string): Promise<void> {
+export async function deletePlayerFromFirestore(uid: string): Promise<void> {
   if (!uid) return;
   try {
-    await Promise.all([
-      rtdbRemove(rtdbRef(rtdb, `players/${uid}`)),
-      rtdbRemove(rtdbRef(rtdb, `users/${uid}`)),
-      rtdbRemove(rtdbRef(rtdb, `friendRequests/${uid}`)),
-      rtdbRemove(rtdbRef(rtdb, `sentRequests/${uid}`)),
-      rtdbRemove(rtdbRef(rtdb, `friends/${uid}`)),
-    ]);
-  } catch (err) {
-    console.warn('Error deleting player from Realtime Database:', err);
+    await deleteDoc(doc(db, 'users', uid));
+  } catch {}
+  if (rtdb) {
+    try {
+      await Promise.all([
+        rtdbRemove(rtdbRef(rtdb, `players/${uid}`)),
+        rtdbRemove(rtdbRef(rtdb, `users/${uid}`)),
+        rtdbRemove(rtdbRef(rtdb, `friendRequests/${uid}`)),
+        rtdbRemove(rtdbRef(rtdb, `sentRequests/${uid}`)),
+        rtdbRemove(rtdbRef(rtdb, `friends/${uid}`)),
+      ]);
+    } catch {}
   }
 }
+export const deletePlayerFromRTDB = deletePlayerFromFirestore;
 
 export function subscribeToPlayers(onUpdate: (players: User[]) => void): () => void {
-  const pRef = rtdbRef(rtdb, 'players');
-  return rtdbOnValue(pRef, (snap) => {
-    if (!snap.exists()) {
-      onUpdate([]);
-    } else {
-      const list = Object.values((snap.val() || {}) as Record<string, any>)
-        .filter(
-          (u) =>
-            u &&
-            u.uid !== 'u_zbs0jd0' &&
-            u.username?.toLowerCase() !== 'kingveno'
-        )
-        .map((u) => {
-          // Never return password fields when reading player data
-          const { password, passwordHash, passwordSalt, ...safeUser } = u;
-          return safeUser as User;
-        });
-      onUpdate(list);
-    }
-  });
+  try {
+    return onSnapshot(
+      collection(db, 'users'),
+      (snap) => {
+        const list = snap.docs
+          .map((d) => d.data())
+          .filter((u: any) => u && u.uid !== 'u_zbs0jd0' && u.username?.toLowerCase() !== 'kingveno')
+          .map((u: any) => {
+            const { password, passwordHash, passwordSalt, ...safeUser } = u;
+            return safeUser as User;
+          });
+        onUpdate(list);
+      },
+      () => {
+        onUpdate([]);
+      }
+    );
+  } catch {
+    return () => {};
+  }
 }
 
 // ==========================================
-// 2. FRIEND REQUESTS & FRIENDS (Realtime Database)
+// 2. FRIEND REQUESTS & FRIENDS
 // ==========================================
 export async function saveFriendRequestToRTDB(targetUid: string, req: FriendRequest): Promise<void> {
-  if (!targetUid || !req || !req.uid) return;
+  if (!rtdb || !targetUid || !req || !req.uid) return;
   try {
     await rtdbSet(rtdbRef(rtdb, `friendRequests/${targetUid}/${req.uid}`), req);
-  } catch (err) {
-    console.error('Error writing friend request to Realtime Database:', err);
-  }
+  } catch {}
 }
 
 export async function getFriendRequestsFromRTDB(targetUid: string): Promise<FriendRequest[]> {
-  if (!targetUid) return [];
+  if (!rtdb || !targetUid) return [];
   try {
     const snap = await rtdbGet(rtdbRef(rtdb, `friendRequests/${targetUid}`));
     if (!snap.exists()) return [];
     const val = snap.val() as Record<string, FriendRequest>;
     return Object.values(val || {});
-  } catch (err) {
-    console.warn('Error reading friend requests from Realtime Database:', err);
+  } catch {
     return [];
   }
 }
 
 export async function removeFriendRequestFromRTDB(targetUid: string, reqUid: string): Promise<void> {
-  if (!targetUid || !reqUid) return;
+  if (!rtdb || !targetUid || !reqUid) return;
   try {
     await rtdbRemove(rtdbRef(rtdb, `friendRequests/${targetUid}/${reqUid}`));
-  } catch (err) {
-    console.warn('Error removing friend request from Realtime Database:', err);
-  }
+  } catch {}
 }
 
 export async function saveSentRequestToRTDB(
   fromUid: string,
   sentData: { targetUid: string; targetUsername: string; targetAvatar?: string; at: number }
 ): Promise<void> {
-  if (!fromUid || !sentData || !sentData.targetUid) return;
+  if (!rtdb || !fromUid || !sentData || !sentData.targetUid) return;
   try {
     await rtdbSet(rtdbRef(rtdb, `sentRequests/${fromUid}/${sentData.targetUid}`), sentData);
-  } catch (err) {
-    console.error('Error saving sent request to Realtime Database:', err);
-  }
+  } catch {}
 }
 
 export async function getSentRequestsFromRTDB(fromUid: string): Promise<any[]> {
-  if (!fromUid) return [];
+  if (!rtdb || !fromUid) return [];
   try {
     const snap = await rtdbGet(rtdbRef(rtdb, `sentRequests/${fromUid}`));
     if (!snap.exists()) return [];
     const val = snap.val() as Record<string, any>;
     return Object.values(val || {});
-  } catch (err) {
-    console.warn('Error reading sent requests from Realtime Database:', err);
+  } catch {
     return [];
   }
 }
 
 export async function removeSentRequestFromRTDB(fromUid: string, targetUid: string): Promise<void> {
-  if (!fromUid || !targetUid) return;
+  if (!rtdb || !fromUid || !targetUid) return;
   try {
     await rtdbRemove(rtdbRef(rtdb, `sentRequests/${fromUid}/${targetUid}`));
-  } catch (err) {
-    console.warn('Error removing sent request from Realtime Database:', err);
-  }
+  } catch {}
 }
 
 export function subscribeToFriendRequests(
   targetUid: string,
   onUpdate: (reqs: FriendRequest[]) => void
 ): () => void {
+  if (!rtdb) return () => {};
   const reqRef = rtdbRef(rtdb, `friendRequests/${targetUid}`);
   return rtdbOnValue(reqRef, (snap) => {
     if (!snap.exists()) {
@@ -326,29 +319,26 @@ export function subscribeToFriendRequests(
 }
 
 export async function saveFriendsToRTDB(uid: string, friends: string[]): Promise<void> {
-  if (!uid) return;
+  if (!rtdb || !uid) return;
   try {
     await rtdbSet(rtdbRef(rtdb, `friends/${uid}`), friends);
-  } catch (err) {
-    console.error('Error writing friends to Realtime Database:', err);
-  }
+  } catch {}
 }
 
 export async function getFriendsFromRTDB(uid: string): Promise<string[]> {
-  if (!uid) return [];
+  if (!rtdb || !uid) return [];
   try {
     const snap = await rtdbGet(rtdbRef(rtdb, `friends/${uid}`));
     if (!snap.exists()) return [];
     const val = snap.val();
     return Array.isArray(val) ? val : Object.values(val || {});
-  } catch (err) {
-    console.warn('Error reading friends from Realtime Database:', err);
+  } catch {
     return [];
   }
 }
 
 // ==========================================
-// 3. ROOMS (Realtime Database & Dual-Write)
+// 3. ROOMS (Firestore Primary)
 // ==========================================
 
 // Helper to sanitize nested arrays for Firestore (Firestore rejects arrays inside arrays and undefined values)
@@ -397,7 +387,7 @@ export function restoreFromFirestore(val: any): any {
   return result;
 }
 
-export async function saveRoomToRTDB(room: Room): Promise<void> {
+export async function saveRoomToFirestore(room: Room): Promise<void> {
   const cleanCode = String(room.code).trim().replace(/^[@#]/, '');
   const payload: Record<string, any> = {
     code: cleanCode,
@@ -417,160 +407,146 @@ export async function saveRoomToRTDB(room: Room): Promise<void> {
     payload.state = room.state;
   }
 
-  // 1. Primary write directly to Realtime Database
-  try {
-    await rtdbSet(rtdbRef(rtdb, `rooms/${cleanCode}`), payload);
-  } catch (rtdbErr) {
-    console.error('Realtime Database Room Write Error:', rtdbErr);
-  }
-
-  // 2. Dual-write to Firestore for redundancy (sanitizes nested arrays)
+  // 1. Primary write directly to Firestore (sanitizes nested arrays)
   try {
     const firestorePayload = sanitizeForFirestore(payload);
     await setDoc(doc(db, 'rooms', cleanCode), firestorePayload);
-  } catch {
-    // Non-blocking fallback
+  } catch (err) {
+    console.warn('Firestore room write notice:', err);
+  }
+
+  // 2. RTDB sync if configured
+  if (rtdb) {
+    try {
+      await rtdbSet(rtdbRef(rtdb, `rooms/${cleanCode}`), payload);
+    } catch {
+      // Non-blocking
+    }
   }
 }
+export const saveRoomToRTDB = saveRoomToFirestore;
 
-export async function getRoomFromRTDB(code: string): Promise<Room | null> {
+export async function getRoomFromFirestore(code: string): Promise<Room | null> {
   const cleanCode = String(code).trim().replace(/^[@#]/, '');
-  // 1. Try Realtime Database first
-  try {
-    const snap = await rtdbGet(rtdbRef(rtdb, `rooms/${cleanCode}`));
-    if (snap.exists()) {
-      return snap.val() as Room;
-    }
-  } catch (err) {
-    console.warn('RTDB room get warning:', err);
-  }
-
-  // 2. Firestore fallback
+  // 1. Try Firestore first
   try {
     const snap = await getDoc(doc(db, 'rooms', cleanCode));
     if (snap.exists()) return restoreFromFirestore(snap.data()) as Room;
-  } catch {
-    // Non-blocking
+  } catch (err) {
+    console.warn('Firestore room get notice:', err);
   }
+
+  // 2. RTDB fallback if configured
+  if (rtdb) {
+    try {
+      const snap = await rtdbGet(rtdbRef(rtdb, `rooms/${cleanCode}`));
+      if (snap.exists()) {
+        return snap.val() as Room;
+      }
+    } catch {
+      // Non-blocking
+    }
+  }
+
   return null;
 }
+export const getRoomFromRTDB = getRoomFromFirestore;
 
-export async function getOpenRoomsFromRTDB(game?: GameId): Promise<Room[]> {
-  try {
-    const snap = await rtdbGet(rtdbRef(rtdb, 'rooms'));
-    if (snap.exists()) {
-      const allRooms = snap.val() as Record<string, Room>;
-      const rooms: Room[] = [];
-      for (const r of Object.values(allRooms || {})) {
-        if (!r || !r.code) continue;
-        if ((!game || r.game === game) && r.status !== 'done') {
-          rooms.push(r);
-        }
-      }
-      return rooms;
-    }
-  } catch (err) {
-    console.warn('RTDB getOpenRooms error:', err);
-  }
-
-  // Fallback to Firestore
+export async function getOpenRoomsFromFirestore(game?: GameId): Promise<Room[]> {
   try {
     const snap = await getDocs(collection(db, 'rooms'));
-    const rooms: Room[] = [];
-    snap.forEach((d) => {
-      const r = restoreFromFirestore(d.data()) as Room;
-      if ((!game || r.game === game) && r.status !== 'done') {
-        rooms.push(r);
-      }
-    });
-    return rooms;
-  } catch {
+    return snap.docs
+      .map((d) => restoreFromFirestore(d.data()) as Room)
+      .filter((r) => r && r.status === 'waiting' && (!game || r.game === game));
+  } catch (err) {
+    console.warn('Firestore getOpenRooms notice:', err);
     return [];
   }
 }
+export const getOpenRoomsFromRTDB = getOpenRoomsFromFirestore;
 
-export async function deleteRoomFromRTDB(code: string): Promise<void> {
+export async function deleteRoomFromFirestore(code: string): Promise<void> {
   const cleanCode = String(code).trim().replace(/^[@#]/, '');
   try {
-    await rtdbRemove(rtdbRef(rtdb, `rooms/${cleanCode}`));
-  } catch (err) {
-    console.warn('RTDB room delete warning:', err);
-  }
-  try {
     await deleteDoc(doc(db, 'rooms', cleanCode));
-  } catch {
-    // Non-blocking
+  } catch (err) {
+    console.warn('Firestore room delete notice:', err);
+  }
+  if (rtdb) {
+    try {
+      await rtdbRemove(rtdbRef(rtdb, `rooms/${cleanCode}`));
+    } catch {}
   }
 }
+export const deleteRoomFromRTDB = deleteRoomFromFirestore;
 
 export function subscribeToRoom(
   code: string,
   onUpdate: (room: Room | null) => void,
-  onError?: (err: Error) => void
+  onError?: (err: any) => void
 ): () => void {
   const cleanCode = String(code).trim().replace(/^[@#]/, '');
-  const roomRef = rtdbRef(rtdb, `rooms/${cleanCode}`);
 
-  const unsubscribeRTDB = rtdbOnValue(
-    roomRef,
-    (snap) => {
-      if (!snap.exists()) {
-        onUpdate(null);
-      } else {
-        onUpdate(snap.val() as Room);
-      }
-    },
-    (err) => {
-      console.warn('RTDB room subscribe error:', err);
-      if (onError) onError(err);
-    }
-  );
+  let unsubscribeRTDB: (() => void) | null = null;
+  if (rtdb) {
+    try {
+      const roomRef = rtdbRef(rtdb, `rooms/${cleanCode}`);
+      unsubscribeRTDB = rtdbOnValue(
+        roomRef,
+        (snap) => {
+          if (snap.exists()) {
+            onUpdate(snap.val() as Room);
+          }
+        },
+        () => {}
+      );
+    } catch {}
+  }
 
-  // Firestore backup listener
+  // Firestore primary listener
   let unsubscribeFS: (() => void) | null = null;
   try {
-    unsubscribeFS = onSnapshot(doc(db, 'rooms', cleanCode), (snap) => {
-      if (snap.exists()) {
-        onUpdate(restoreFromFirestore(snap.data()) as Room);
+    unsubscribeFS = onSnapshot(
+      doc(db, 'rooms', cleanCode),
+      (snap) => {
+        if (!snap.exists()) {
+          if (!rtdb) onUpdate(null);
+        } else {
+          onUpdate(restoreFromFirestore(snap.data()) as Room);
+        }
+      },
+      (err) => {
+        if (onError) onError(err);
       }
-    });
+    );
   } catch {
     // Non-blocking
   }
 
   return () => {
-    unsubscribeRTDB();
+    if (unsubscribeRTDB) unsubscribeRTDB();
     if (unsubscribeFS) unsubscribeFS();
   };
 }
 
-// Aliases for full compatibility
-export const saveRoomToFirestore = saveRoomToRTDB;
-export const getRoomFromFirestore = getRoomFromRTDB;
-export const getOpenRoomsFromFirestore = getOpenRoomsFromRTDB;
-export const deleteRoomFromFirestore = deleteRoomFromRTDB;
-
 // ==========================================
-// 4. CHAT (Realtime Database)
+// 4. CHAT
 // ==========================================
 export async function saveChatMessageToRTDB(channel: string, msg: ChatMessage): Promise<void> {
-  if (!channel || !msg || !msg.id) return;
+  if (!rtdb || !channel || !msg || !msg.id) return;
   try {
     await rtdbSet(rtdbRef(rtdb, `chats/${channel}/${msg.id}`), msg);
-  } catch (err) {
-    console.error('Error writing chat message to Realtime Database:', err);
-  }
+  } catch {}
 }
 
 export async function getChatMessagesFromRTDB(channel: string): Promise<ChatMessage[]> {
-  if (!channel) return [];
+  if (!rtdb || !channel) return [];
   try {
     const snap = await rtdbGet(rtdbRef(rtdb, `chats/${channel}`));
     if (!snap.exists()) return [];
     const val = snap.val() as Record<string, ChatMessage>;
     return Object.values(val || {}).sort((a, b) => (a.at || 0) - (b.at || 0));
-  } catch (err) {
-    console.warn('Error reading chat messages from Realtime Database:', err);
+  } catch {
     return [];
   }
 }
@@ -579,6 +555,7 @@ export function subscribeToChat(
   channel: string,
   onUpdate: (msgs: ChatMessage[]) => void
 ): () => void {
+  if (!rtdb) return () => {};
   const cRef = rtdbRef(rtdb, `chats/${channel}`);
   return rtdbOnValue(cRef, (snap) => {
     if (!snap.exists()) {
@@ -590,4 +567,3 @@ export function subscribeToChat(
     }
   });
 }
-

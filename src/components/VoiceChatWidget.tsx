@@ -171,6 +171,13 @@ export const VoiceChatWidget: React.FC<VoiceChatWidgetProps> = ({
         </div>
       </div>
 
+      {error && (
+        <div className="p-2 mx-2.5 mt-2 bg-rose-950/80 border border-rose-800 rounded-lg text-[11px] text-rose-300 flex items-center gap-1.5 animate-in fade-in">
+          <AlertCircle className="w-3.5 h-3.5 shrink-0 text-rose-400" />
+          <span>{error}</span>
+        </div>
+      )}
+
       {/* Participants List */}
       {isExpanded && !compactOnly && (
         <div className="p-2.5 space-y-2 bg-slate-950/50 animate-in fade-in">

@@ -1,0 +1,10 @@
+Replace the voice chat with our own WebRTC voice chat. Remove LiveKit completely — no LiveKit SDK, no token server, no API keys.
+
+- Use plain RTCPeerConnection, audio only, between the human players in a room. For 3-4 player tables, connect each human to every other human (mesh).
+- Use the same database the game rooms already use for signaling: store each player's offer, answer, and ICE candidates with the room, namespaced per player pair.
+- Use Google's free STUN server: stun:stun.l.google.com:19302. No TURN server.
+- Mic access must be the simplest possible request: navigator.mediaDevices.getUserMedia({ audio: true }) — no extra constraints.
+- Keep the existing UI: Join Voice Talk button, mute button, and the "in call" count.
+- IMPORTANT: if anything fails, show the real error name and message in the red banner (for example "NotReadableError: ..."), not a friendly generic message.
+
+Change nothing else. When done, show me the preview.

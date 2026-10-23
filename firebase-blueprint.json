@@ -60,6 +60,50 @@
       },
       "required": ["code", "game", "seatsNeeded", "seats", "host", "status"]
     },
+    "User": {
+      "title": "User",
+      "description": "Player or guest user profile document.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Unique identifier of the user",
+          "maxLength": 128
+        },
+        "username": {
+          "type": "string",
+          "description": "Display name of the user",
+          "maxLength": 64
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address",
+          "maxLength": 128
+        },
+        "points": {
+          "type": "number",
+          "description": "User game tokens / points balance"
+        },
+        "wins": {
+          "type": "object",
+          "description": "Map of game wins count"
+        },
+        "lastDaily": {
+          "type": "number",
+          "description": "Timestamp of last daily reward claim"
+        },
+        "avatar": {
+          "type": "string",
+          "description": "Avatar icon or URL string",
+          "maxLength": 128
+        },
+        "lastSeen": {
+          "type": "number",
+          "description": "Timestamp of last activity"
+        }
+      },
+      "required": ["uid", "username"]
+    },
     "TestConnection": {
       "title": "TestConnection",
       "description": "System health check document to test database connection on application boot.",
@@ -75,12 +119,96 @@
         }
       },
       "required": ["ok"]
+    },
+    "VoiceSignal": {
+      "title": "VoiceSignal",
+      "description": "WebRTC offer, answer, and ICE candidates per player pair for voice chat.",
+      "type": "object",
+      "properties": {
+        "pairId": {
+          "type": "string",
+          "description": "Pair identifier composed of sorted player UIDs"
+        },
+        "initiatorUid": {
+          "type": "string",
+          "description": "Offerer player UID"
+        },
+        "receiverUid": {
+          "type": "string",
+          "description": "Answerer player UID"
+        },
+        "offer": {
+          "type": "object",
+          "description": "WebRTC SDP offer"
+        },
+        "answer": {
+          "type": "object",
+          "description": "WebRTC SDP answer"
+        },
+        "candidatesA": {
+          "type": "array",
+          "description": "ICE candidates from initiator"
+        },
+        "candidatesB": {
+          "type": "array",
+          "description": "ICE candidates from receiver"
+        },
+        "updatedAt": {
+          "type": "number",
+          "description": "Timestamp of last signal update"
+        }
+      },
+      "required": ["pairId", "initiatorUid", "receiverUid"]
+    },
+    "VoicePresence": {
+      "title": "VoicePresence",
+      "description": "Active participant in room voice chat.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Player UID"
+        },
+        "username": {
+          "type": "string",
+          "description": "Player display name"
+        },
+        "avatar": {
+          "type": "string",
+          "description": "Player avatar"
+        },
+        "isMuted": {
+          "type": "boolean",
+          "description": "Whether participant microphone is muted"
+        },
+        "isSpeaking": {
+          "type": "boolean",
+          "description": "Whether participant is currently speaking"
+        },
+        "joinedAt": {
+          "type": "number",
+          "description": "Timestamp when player joined voice talk"
+        }
+      },
+      "required": ["uid", "username"]
     }
   },
   "firestore": {
     "/rooms/{roomId}": {
       "schema": "Room",
       "description": "Realtime multiplayer game rooms accessible across devices."
+    },
+    "/rooms/{roomId}/voice_signals/{pairId}": {
+      "schema": "VoiceSignal",
+      "description": "WebRTC signaling state between human player pairs."
+    },
+    "/rooms/{roomId}/voice_presence/{userId}": {
+      "schema": "VoicePresence",
+      "description": "Voice chat participant presence in the room."
+    },
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile collection."
     },
     "/test/{docId}": {
       "schema": "TestConnection",

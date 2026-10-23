@@ -1,12 +1,14 @@
 import {
-  ref as rtdbRef,
-  set as rtdbSet,
-  remove as rtdbRemove,
-  onValue as rtdbOnValue,
-  push as rtdbPush,
-  onDisconnect,
-} from 'firebase/database';
-import { rtdb } from '../firebase';
+  doc,
+  setDoc,
+  deleteDoc,
+  updateDoc,
+  collection,
+  onSnapshot,
+  arrayUnion,
+  Unsubscribe,
+} from 'firebase/firestore';
+import { db } from '../firebase';
 import { User, Room } from '../types';
 
 export interface VoiceParticipant {
@@ -16,15 +18,6 @@ export interface VoiceParticipant {
   isMuted: boolean;
   isSpeaking: boolean;
   joinedAt: number;
-}
-
-export interface VoiceSignal {
-  id?: string;
-  from: string;
-  target: string;
-  type: 'offer' | 'answer' | 'candidate';
-  payload: any;
-  timestamp: number;
 }
 
 export type VoiceStateChangeCallback = (state: {
@@ -37,20 +30,23 @@ export type VoiceStateChangeCallback = (state: {
   participants: VoiceParticipant[];
 }) => void;
 
-const ICE_SERVERS: RTCConfiguration = {
+// Only Google's free STUN server, no TURN server per specification
+const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
   ],
 };
 
 interface PeerConnectionData {
+  pairId: string;
+  remoteUid: string;
   pc: RTCPeerConnection;
   audio: HTMLAudioElement;
-  analyser?: AnalyserNode;
   candidateQueue: RTCIceCandidateInit[];
-  isRemoteDescriptionSet: boolean;
+  processedCandidates: Set<string>;
+  lastProcessedOfferSdp: string | null;
+  lastProcessedAnswerSdp: string | null;
+  unsubscribePair: Unsubscribe | null;
 }
 
 export class VoiceService {
@@ -71,9 +67,18 @@ export class VoiceService {
   private localAnalyser: AnalyserNode | null = null;
   private speakingInterval: any = null;
 
-  private unsubscribePresence: (() => void) | null = null;
-  private unsubscribeSignals: (() => void) | null = null;
+  private unsubscribePresence: Unsubscribe | null = null;
   private onStateChange: VoiceStateChangeCallback | null = null;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      window.addEventListener('beforeunload', () => {
+        if (this.isConnected || this.isConnecting) {
+          this.leaveVoice().catch(() => {});
+        }
+      });
+    }
+  }
 
   public subscribeState(cb: VoiceStateChangeCallback): () => void {
     this.onStateChange = cb;
@@ -106,40 +111,33 @@ export class VoiceService {
     this.emitState();
 
     try {
-      // 1. Request microphone stream
+      // 1. Simplest possible microphone access request: navigator.mediaDevices.getUserMedia({ audio: true })
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('Microphone access is not supported by your browser.');
+        const notSupportedErr = new Error('navigator.mediaDevices.getUserMedia is not supported by your browser');
+        notSupportedErr.name = 'NotSupportedError';
+        throw notSupportedErr;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-        video: false,
-      });
-
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       this.localStream = stream;
       this.isMuted = false;
       this.isDeafened = false;
 
-      // 2. Set up Web Audio Analyser for detecting speech volume
+      // 2. Set up Web Audio Analyser for speaking indicator
       this.setupAudioAnalysis(stream);
 
-      // 3. Register presence in RTDB
-      await this.publishPresence({
+      // 3. Register voice presence in Firestore under the room document
+      await setDoc(doc(db, 'rooms', this.roomCode, 'voice_presence', user.uid), {
         uid: user.uid,
         username: user.username,
-        avatar: user.avatar,
+        avatar: user.avatar || '🎧',
         isMuted: false,
         isSpeaking: false,
         joinedAt: Date.now(),
       });
 
-      // 4. Listen to participants and incoming signals
+      // 4. Listen to active voice participants in the room
       this.listenToPresence();
-      this.listenToSignals();
 
       this.isConnected = true;
       this.isConnecting = false;
@@ -147,15 +145,12 @@ export class VoiceService {
       return true;
     } catch (err: any) {
       console.warn('Voice chat join error:', err);
-      let errMsg = 'Could not access microphone.';
-      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-        errMsg = 'Microphone permission denied. Please allow microphone in browser settings.';
-      } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
-        errMsg = 'No microphone device found on this system.';
-      } else if (err.message) {
-        errMsg = err.message;
-      }
-      this.error = errMsg;
+      // IMPORTANT: Show real error name and message in red banner, not a friendly generic message
+      const rawError = err?.name && err?.message
+        ? `${err.name}: ${err.message}`
+        : (err?.message || (err?.name ? `${err.name}` : String(err)));
+
+      this.error = rawError;
       this.isConnecting = false;
       this.isConnected = false;
       this.cleanupMedia();
@@ -167,24 +162,36 @@ export class VoiceService {
   public async leaveVoice(): Promise<void> {
     if (!this.isConnected && !this.isConnecting) return;
 
-    if (this.roomCode && this.currentUser) {
+    const currentRoomCode = this.roomCode;
+    const currentUid = this.currentUser?.uid;
+
+    // Remove presence document from Firestore
+    if (currentRoomCode && currentUid) {
       try {
-        const presRef = rtdbRef(rtdb, `voice_presence/${this.roomCode}/${this.currentUser.uid}`);
-        await rtdbRemove(presRef);
+        await deleteDoc(doc(db, 'rooms', currentRoomCode, 'voice_presence', currentUid));
       } catch {
-        // non-blocking
+        // Non-blocking cleanup
       }
     }
 
     this.cleanupMedia();
-    this.cleanupSubscriptions();
+    this.cleanupPresenceSubscription();
+
+    // Close and cleanup all peer connections and their signaling listeners
     this.peers.forEach((peer) => {
       try {
+        if (peer.unsubscribePair) peer.unsubscribePair();
         peer.pc.close();
         peer.audio.srcObject = null;
         peer.audio.remove();
       } catch {}
+
+      // Clean up signaling doc if initiated by us
+      if (currentRoomCode) {
+        deleteDoc(doc(db, 'rooms', currentRoomCode, 'voice_signals', peer.pairId)).catch(() => {});
+      }
     });
+
     this.peers.clear();
     this.participants.clear();
 
@@ -204,7 +211,7 @@ export class VoiceService {
     });
 
     if (this.currentUser && this.roomCode) {
-      this.publishPresenceField({ isMuted: this.isMuted, isSpeaking: false });
+      this.updatePresenceField({ isMuted: this.isMuted, isSpeaking: false });
     }
     this.emitState();
     return this.isMuted;
@@ -242,7 +249,7 @@ export class VoiceService {
           if (this.isSpeaking) {
             this.isSpeaking = false;
             this.emitState();
-            this.publishPresenceField({ isSpeaking: false });
+            this.updatePresenceField({ isSpeaking: false });
           }
           return;
         }
@@ -253,10 +260,10 @@ export class VoiceService {
           sum += dataArray[i];
         }
         const avg = sum / bufferLength;
-        const nowSpeaking = avg > 14; // threshold
+        const nowSpeaking = avg > 14;
 
         if (nowSpeaking) {
-          speakingCounter = 3; // hold speaking state briefly
+          speakingCounter = 3;
         } else if (speakingCounter > 0) {
           speakingCounter--;
         }
@@ -265,9 +272,9 @@ export class VoiceService {
         if (activeSpeaking !== this.isSpeaking) {
           this.isSpeaking = activeSpeaking;
           this.emitState();
-          this.publishPresenceField({ isSpeaking: activeSpeaking });
+          this.updatePresenceField({ isSpeaking: activeSpeaking });
         }
-      }, 120);
+      }, 150);
     } catch (err) {
       console.warn('Audio analysis setup warning:', err);
     }
@@ -289,237 +296,313 @@ export class VoiceService {
     }
   }
 
-  private cleanupSubscriptions() {
+  private cleanupPresenceSubscription() {
     if (this.unsubscribePresence) {
       this.unsubscribePresence();
       this.unsubscribePresence = null;
     }
-    if (this.unsubscribeSignals) {
-      this.unsubscribeSignals();
-      this.unsubscribeSignals = null;
-    }
   }
 
-  private async publishPresence(participant: VoiceParticipant) {
+  private updatePresenceField(fields: Partial<VoiceParticipant>) {
     if (!this.roomCode || !this.currentUser) return;
     try {
-      const presRef = rtdbRef(rtdb, `voice_presence/${this.roomCode}/${participant.uid}`);
-      await rtdbSet(presRef, participant);
-      // Automatically clear presence if browser disconnects unexpectedly
-      try {
-        onDisconnect(presRef).remove();
-      } catch {}
-    } catch (err) {
-      console.warn('publishPresence warning:', err);
-    }
-  }
-
-  private publishPresenceField(fields: Partial<VoiceParticipant>) {
-    if (!this.roomCode || !this.currentUser) return;
-    try {
-      const presRef = rtdbRef(rtdb, `voice_presence/${this.roomCode}/${this.currentUser.uid}`);
-      const current = this.participants.get(this.currentUser.uid);
-      if (current) {
-        const updated = { ...current, ...fields };
-        rtdbSet(presRef, updated).catch(() => {});
-      }
+      const presRef = doc(db, 'rooms', this.roomCode, 'voice_presence', this.currentUser.uid);
+      updateDoc(presRef, fields).catch(() => {});
     } catch {}
   }
 
   private listenToPresence() {
     if (!this.roomCode || !this.currentUser) return;
-    const roomPresRef = rtdbRef(rtdb, `voice_presence/${this.roomCode}`);
+    const roomCode = this.roomCode;
+    const currentUid = this.currentUser.uid;
+    const presenceColRef = collection(db, 'rooms', roomCode, 'voice_presence');
 
-    this.unsubscribePresence = rtdbOnValue(roomPresRef, (snapshot) => {
-      const val = snapshot.val() || {};
-      const newParticipants = new Map<string, VoiceParticipant>();
+    this.unsubscribePresence = onSnapshot(
+      presenceColRef,
+      (snapshot) => {
+        const newParticipants = new Map<string, VoiceParticipant>();
 
-      Object.keys(val).forEach((uid) => {
-        const p = val[uid] as VoiceParticipant;
-        if (p && p.uid) {
-          newParticipants.set(p.uid, p);
-        }
-      });
+        snapshot.docs.forEach((d) => {
+          const p = d.data() as VoiceParticipant;
+          if (p && p.uid) {
+            newParticipants.set(p.uid, p);
+          }
+        });
 
-      this.participants = newParticipants;
-      this.emitState();
+        this.participants = newParticipants;
+        this.emitState();
 
-      // Check for remote peers that we need to connect with
-      newParticipants.forEach((p, uid) => {
-        if (uid !== this.currentUser?.uid && !this.peers.has(uid)) {
-          this.initiatePeerConnection(uid);
-        }
-      });
+        // Connect to every other human participant in mesh (2, 3, or 4 human players)
+        newParticipants.forEach((p, uid) => {
+          // Ignore self and automated bot seats
+          const isBot = uid.startsWith('bot_') || uid.startsWith('robot_') || uid.includes('test_bot');
+          if (uid !== currentUid && !isBot && !this.peers.has(uid)) {
+            this.setupPeerForRemoteUser(uid);
+          }
+        });
 
-      // Remove peer connections for players that left voice
-      this.peers.forEach((peer, uid) => {
-        if (!newParticipants.has(uid)) {
-          try {
-            peer.pc.close();
-            peer.audio.srcObject = null;
-            peer.audio.remove();
-          } catch {}
-          this.peers.delete(uid);
-        }
-      });
-    });
+        // Clean up peers for players that left voice
+        this.peers.forEach((peer, uid) => {
+          if (!newParticipants.has(uid)) {
+            this.removePeer(uid);
+          }
+        });
+      },
+      (err) => {
+        console.warn('Voice presence listener error:', err);
+        const rawError = err?.name && err?.message
+          ? `${err.name}: ${err.message}`
+          : (err?.message || String(err));
+        this.error = rawError;
+        this.emitState();
+      }
+    );
   }
 
-  private listenToSignals() {
-    if (!this.roomCode || !this.currentUser) return;
-    const mySignalsRef = rtdbRef(rtdb, `voice_signals/${this.roomCode}/${this.currentUser.uid}`);
-
-    this.unsubscribeSignals = rtdbOnValue(mySignalsRef, (snapshot) => {
-      const val = snapshot.val();
-      if (!val) return;
-
-      Object.entries(val).forEach(async ([key, rawSignal]: [string, any]) => {
-        // Delete processed signal to prevent re-processing
-        rtdbRemove(rtdbRef(rtdb, `voice_signals/${this.roomCode}/${this.currentUser!.uid}/${key}`)).catch(() => {});
-
-        const signal = rawSignal as VoiceSignal;
-        if (!signal || !signal.from || signal.from === this.currentUser?.uid) return;
-
-        await this.handleIncomingSignal(signal);
-      });
-    });
+  private getPairId(uidA: string, uidB: string): string {
+    const [p1, p2] = uidA < uidB ? [uidA, uidB] : [uidB, uidA];
+    return `${p1}_${p2}`;
   }
 
-  private getOrCreatePeer(remoteUid: string): PeerConnectionData {
-    let peer = this.peers.get(remoteUid);
-    if (peer) return peer;
+  private removePeer(remoteUid: string) {
+    const peer = this.peers.get(remoteUid);
+    if (!peer) return;
 
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    try {
+      if (peer.unsubscribePair) peer.unsubscribePair();
+      peer.pc.close();
+      peer.audio.srcObject = null;
+      peer.audio.remove();
+    } catch {}
+
+    this.peers.delete(remoteUid);
+  }
+
+  private setupPeerForRemoteUser(remoteUid: string) {
+    if (!this.roomCode || !this.currentUser || !this.localStream) return;
+
+    const myUid = this.currentUser.uid;
+    const pairId = this.getPairId(myUid, remoteUid);
+    const isInitiator = myUid < remoteUid;
+
+    const pc = new RTCPeerConnection(RTC_CONFIG);
     const audio = new Audio();
     audio.autoplay = true;
     audio.muted = this.isDeafened;
 
-    peer = {
+    const peerData: PeerConnectionData = {
+      pairId,
+      remoteUid,
       pc,
       audio,
       candidateQueue: [],
-      isRemoteDescriptionSet: false,
+      processedCandidates: new Set<string>(),
+      lastProcessedOfferSdp: null,
+      lastProcessedAnswerSdp: null,
+      unsubscribePair: null,
     };
-    this.peers.set(remoteUid, peer);
+
+    this.peers.set(remoteUid, peerData);
 
     // 1. Add local audio tracks to peer connection
-    if (this.localStream) {
-      this.localStream.getAudioTracks().forEach((track) => {
-        pc.addTrack(track, this.localStream!);
-      });
-    }
+    this.localStream.getAudioTracks().forEach((track) => {
+      pc.addTrack(track, this.localStream!);
+    });
 
-    // 2. Handle remote audio stream
+    // 2. Play remote audio stream when tracks arrive
     pc.ontrack = (event) => {
       if (event.streams && event.streams[0]) {
-        peer!.audio.srcObject = event.streams[0];
-        peer!.audio.play().catch((e) => console.warn('Remote audio play warning:', e));
+        peerData.audio.srcObject = event.streams[0];
+        peerData.audio.play().catch((e) => console.warn('Remote audio play warning:', e));
       }
     };
 
-    // 3. Handle ICE candidates
-    pc.onicecandidate = (event) => {
-      if (event.candidate && this.roomCode && this.currentUser) {
-        this.sendSignal(remoteUid, {
-          from: this.currentUser.uid,
-          target: remoteUid,
-          type: 'candidate',
-          payload: event.candidate.toJSON(),
-          timestamp: Date.now(),
-        });
+    // 3. Send ICE candidates to Firestore per player pair
+    const pairDocRef = doc(db, 'rooms', this.roomCode, 'voice_signals', pairId);
+
+    pc.onicecandidate = async (event) => {
+      if (event.candidate && this.roomCode) {
+        const cand = event.candidate.toJSON();
+        const fieldName = isInitiator ? 'candidatesA' : 'candidatesB';
+
+        try {
+          await updateDoc(pairDocRef, {
+            [fieldName]: arrayUnion(cand),
+            updatedAt: Date.now(),
+          });
+        } catch {
+          // If pair document does not exist yet, initialize it
+          try {
+            await setDoc(
+              pairDocRef,
+              {
+                pairId,
+                initiatorUid: isInitiator ? myUid : remoteUid,
+                receiverUid: isInitiator ? remoteUid : myUid,
+                [fieldName]: [cand],
+                updatedAt: Date.now(),
+              },
+              { merge: true }
+            );
+          } catch (err: any) {
+            console.warn('Failed to send ICE candidate:', err);
+          }
+        }
       }
     };
 
-    // 4. Handle connection state changes
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        console.warn(`Peer connection with ${remoteUid} is ${pc.connectionState}`);
+      if (pc.connectionState === 'failed') {
+        const failMsg = `RTCPeerConnection failed with peer ${remoteUid}`;
+        console.warn(failMsg);
       }
     };
 
-    return peer;
-  }
-
-  private async initiatePeerConnection(remoteUid: string) {
-    if (!this.currentUser || !this.roomCode) return;
-    const peer = this.getOrCreatePeer(remoteUid);
-
-    // Use perfect negotiation: only the "polite" peer initiates the offer to avoid collision
-    const isInitiator = this.currentUser.uid > remoteUid;
+    // 4. Initiator creates the WebRTC offer
     if (isInitiator) {
-      try {
-        const offer = await peer.pc.createOffer({
-          offerToReceiveAudio: true,
+      pc.createOffer({ offerToReceiveAudio: true })
+        .then(async (offer) => {
+          await pc.setLocalDescription(offer);
+          await setDoc(
+            pairDocRef,
+            {
+              pairId,
+              initiatorUid: myUid,
+              receiverUid: remoteUid,
+              offer: {
+                type: offer.type,
+                sdp: offer.sdp,
+                from: myUid,
+                timestamp: Date.now(),
+              },
+              updatedAt: Date.now(),
+            },
+            { merge: true }
+          );
+        })
+        .catch((err: any) => {
+          console.warn('Create offer error:', err);
+          const rawError = err?.name && err?.message
+            ? `${err.name}: ${err.message}`
+            : (err?.message || String(err));
+          this.error = rawError;
+          this.emitState();
         });
-        await peer.pc.setLocalDescription(offer);
+    }
 
-        await this.sendSignal(remoteUid, {
-          from: this.currentUser.uid,
-          target: remoteUid,
-          type: 'offer',
-          payload: offer,
-          timestamp: Date.now(),
-        });
-      } catch (err) {
-        console.warn('Create offer error:', err);
+    // 5. Listen to signaling document for this player pair
+    peerData.unsubscribePair = onSnapshot(
+      pairDocRef,
+      async (snapshot) => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data();
+        if (!data) return;
+
+        try {
+          if (isInitiator) {
+            // Initiator waits for answer
+            if (data.answer && data.answer.sdp && data.answer.sdp !== peerData.lastProcessedAnswerSdp) {
+              peerData.lastProcessedAnswerSdp = data.answer.sdp;
+              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+
+              // Drain any queued ICE candidates
+              while (peerData.candidateQueue.length > 0) {
+                const cand = peerData.candidateQueue.shift()!;
+                await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+              }
+            }
+
+            // Ingest candidates from receiver (candidatesB)
+            if (Array.isArray(data.candidatesB)) {
+              for (const cand of data.candidatesB) {
+                const key = JSON.stringify(cand);
+                if (!peerData.processedCandidates.has(key)) {
+                  peerData.processedCandidates.add(key);
+                  if (pc.remoteDescription && pc.remoteDescription.type) {
+                    await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                  } else {
+                    peerData.candidateQueue.push(cand);
+                  }
+                }
+              }
+            }
+          } else {
+            // Receiver handles incoming offer
+            if (data.offer && data.offer.sdp && data.offer.sdp !== peerData.lastProcessedOfferSdp) {
+              peerData.lastProcessedOfferSdp = data.offer.sdp;
+              await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+
+              // Drain any queued ICE candidates
+              while (peerData.candidateQueue.length > 0) {
+                const cand = peerData.candidateQueue.shift()!;
+                await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+              }
+
+              // Create and send answer
+              const answer = await pc.createAnswer();
+              await pc.setLocalDescription(answer);
+
+              await updateDoc(pairDocRef, {
+                answer: {
+                  type: answer.type,
+                  sdp: answer.sdp,
+                  from: myUid,
+                  timestamp: Date.now(),
+                },
+                updatedAt: Date.now(),
+              }).catch(async () => {
+                await setDoc(
+                  pairDocRef,
+                  {
+                    pairId,
+                    initiatorUid: remoteUid,
+                    receiverUid: myUid,
+                    answer: {
+                      type: answer.type,
+                      sdp: answer.sdp,
+                      from: myUid,
+                      timestamp: Date.now(),
+                    },
+                    updatedAt: Date.now(),
+                  },
+                  { merge: true }
+                );
+              });
+            }
+
+            // Ingest candidates from initiator (candidatesA)
+            if (Array.isArray(data.candidatesA)) {
+              for (const cand of data.candidatesA) {
+                const key = JSON.stringify(cand);
+                if (!peerData.processedCandidates.has(key)) {
+                  peerData.processedCandidates.add(key);
+                  if (pc.remoteDescription && pc.remoteDescription.type) {
+                    await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                  } else {
+                    peerData.candidateQueue.push(cand);
+                  }
+                }
+              }
+            }
+          }
+        } catch (err: any) {
+          console.warn(`Signaling error with peer ${remoteUid}:`, err);
+          const rawError = err?.name && err?.message
+            ? `${err.name}: ${err.message}`
+            : (err?.message || String(err));
+          this.error = rawError;
+          this.emitState();
+        }
+      },
+      (err) => {
+        console.warn(`Signal listener error for pair ${pairId}:`, err);
+        const rawError = err?.name && err?.message
+          ? `${err.name}: ${err.message}`
+          : (err?.message || String(err));
+        this.error = rawError;
+        this.emitState();
       }
-    }
-  }
-
-  private async handleIncomingSignal(signal: VoiceSignal) {
-    const remoteUid = signal.from;
-    const peer = this.getOrCreatePeer(remoteUid);
-
-    try {
-      if (signal.type === 'offer') {
-        await peer.pc.setRemoteDescription(new RTCSessionDescription(signal.payload));
-        peer.isRemoteDescriptionSet = true;
-
-        // Drain queued candidates
-        while (peer.candidateQueue.length > 0) {
-          const cand = peer.candidateQueue.shift()!;
-          await peer.pc.addIceCandidate(new RTCIceCandidate(cand));
-        }
-
-        const answer = await peer.pc.createAnswer();
-        await peer.pc.setLocalDescription(answer);
-
-        await this.sendSignal(remoteUid, {
-          from: this.currentUser!.uid,
-          target: remoteUid,
-          type: 'answer',
-          payload: answer,
-          timestamp: Date.now(),
-        });
-      } else if (signal.type === 'answer') {
-        await peer.pc.setRemoteDescription(new RTCSessionDescription(signal.payload));
-        peer.isRemoteDescriptionSet = true;
-
-        // Drain queued candidates
-        while (peer.candidateQueue.length > 0) {
-          const cand = peer.candidateQueue.shift()!;
-          await peer.pc.addIceCandidate(new RTCIceCandidate(cand));
-        }
-      } else if (signal.type === 'candidate' && signal.payload) {
-        if (peer.isRemoteDescriptionSet) {
-          await peer.pc.addIceCandidate(new RTCIceCandidate(signal.payload));
-        } else {
-          peer.candidateQueue.push(signal.payload);
-        }
-      }
-    } catch (err) {
-      console.warn('handleIncomingSignal error:', err);
-    }
-  }
-
-  private async sendSignal(targetUid: string, signal: VoiceSignal) {
-    if (!this.roomCode) return;
-    try {
-      const targetSignalRef = rtdbRef(rtdb, `voice_signals/${this.roomCode}/${targetUid}`);
-      await rtdbPush(targetSignalRef, signal);
-    } catch (err) {
-      console.warn('sendSignal warning:', err);
-    }
+    );
   }
 }
 
