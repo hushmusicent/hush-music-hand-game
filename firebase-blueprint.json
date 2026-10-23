@@ -153,6 +153,18 @@
           "type": "array",
           "description": "ICE candidates from receiver"
         },
+        "sessionId": {
+          "type": "string",
+          "description": "Session identifier for current voice session"
+        },
+        "initiatorSessionId": {
+          "type": "string",
+          "description": "Session identifier of offerer"
+        },
+        "receiverSessionId": {
+          "type": "string",
+          "description": "Session identifier of answerer"
+        },
         "updatedAt": {
           "type": "number",
           "description": "Timestamp of last signal update"
@@ -188,6 +200,10 @@
         "joinedAt": {
           "type": "number",
           "description": "Timestamp when player joined voice talk"
+        },
+        "sessionId": {
+          "type": "string",
+          "description": "Session identifier for active join"
         }
       },
       "required": ["uid", "username"]

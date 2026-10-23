@@ -18,6 +18,7 @@ export interface VoiceParticipant {
   isMuted: boolean;
   isSpeaking: boolean;
   joinedAt: number;
+  sessionId?: string;
 }
 
 export type VoiceStateChangeCallback = (state: {
@@ -40,10 +41,12 @@ const RTC_CONFIG: RTCConfiguration = {
 interface PeerConnectionData {
   pairId: string;
   remoteUid: string;
+  remoteSessionId: string;
   pc: RTCPeerConnection;
   audio: HTMLAudioElement;
   candidateQueue: RTCIceCandidateInit[];
   processedCandidates: Set<string>;
+  currentOfferSessionId: string | null;
   lastProcessedOfferSdp: string | null;
   lastProcessedAnswerSdp: string | null;
   unsubscribePair: Unsubscribe | null;
@@ -52,6 +55,7 @@ interface PeerConnectionData {
 export class VoiceService {
   private roomCode: string | null = null;
   private currentUser: User | null = null;
+  private currentSessionId: string | null = null;
   private localStream: MediaStream | null = null;
   private isMuted: boolean = false;
   private isDeafened: boolean = false;
@@ -123,6 +127,11 @@ export class VoiceService {
       this.isMuted = false;
       this.isDeafened = false;
 
+      // Stamp this voice join with a unique session ID
+      const joinedAt = Date.now();
+      const sessionId = `${user.uid}_${joinedAt}_${Math.random().toString(36).substring(2, 6)}`;
+      this.currentSessionId = sessionId;
+
       // 2. Set up Web Audio Analyser for speaking indicator
       this.setupAudioAnalysis(stream);
 
@@ -133,7 +142,8 @@ export class VoiceService {
         avatar: user.avatar || '🎧',
         isMuted: false,
         isSpeaking: false,
-        joinedAt: Date.now(),
+        joinedAt,
+        sessionId,
       });
 
       // 4. Listen to active voice participants in the room
@@ -165,7 +175,7 @@ export class VoiceService {
     const currentRoomCode = this.roomCode;
     const currentUid = this.currentUser?.uid;
 
-    // Remove presence document from Firestore
+    // 1. Remove presence document from Firestore
     if (currentRoomCode && currentUid) {
       try {
         await deleteDoc(doc(db, 'rooms', currentRoomCode, 'voice_presence', currentUid));
@@ -174,10 +184,19 @@ export class VoiceService {
       }
     }
 
+    // 2. Delete voice_signals documents for all pairs involving this player
+    if (currentRoomCode) {
+      this.peers.forEach((peer) => {
+        try {
+          deleteDoc(doc(db, 'rooms', currentRoomCode, 'voice_signals', peer.pairId)).catch(() => {});
+        } catch {}
+      });
+    }
+
     this.cleanupMedia();
     this.cleanupPresenceSubscription();
 
-    // Close and cleanup all peer connections and their signaling listeners
+    // 3. Close and cleanup all peer connections and their signaling listeners
     this.peers.forEach((peer) => {
       try {
         if (peer.unsubscribePair) peer.unsubscribePair();
@@ -185,11 +204,6 @@ export class VoiceService {
         peer.audio.srcObject = null;
         peer.audio.remove();
       } catch {}
-
-      // Clean up signaling doc if initiated by us
-      if (currentRoomCode) {
-        deleteDoc(doc(db, 'rooms', currentRoomCode, 'voice_signals', peer.pairId)).catch(() => {});
-      }
     });
 
     this.peers.clear();
@@ -200,6 +214,7 @@ export class VoiceService {
     this.isSpeaking = false;
     this.roomCode = null;
     this.currentUser = null;
+    this.currentSessionId = null;
     this.emitState();
   }
 
@@ -336,8 +351,18 @@ export class VoiceService {
         newParticipants.forEach((p, uid) => {
           // Ignore self and automated bot seats
           const isBot = uid.startsWith('bot_') || uid.startsWith('robot_') || uid.includes('test_bot');
-          if (uid !== currentUid && !isBot && !this.peers.has(uid)) {
-            this.setupPeerForRemoteUser(uid);
+          if (uid !== currentUid && !isBot) {
+            const remoteSessionId = p.sessionId || String(p.joinedAt);
+            const existingPeer = this.peers.get(uid);
+
+            if (!existingPeer) {
+              // Brand new peer connection
+              this.setupPeerForRemoteUser(uid, remoteSessionId);
+            } else if (existingPeer.remoteSessionId && existingPeer.remoteSessionId !== remoteSessionId) {
+              // Remote peer rejoined with a new session! Cleanly reset connection
+              this.removePeer(uid);
+              this.setupPeerForRemoteUser(uid, remoteSessionId);
+            }
           }
         });
 
@@ -345,6 +370,10 @@ export class VoiceService {
         this.peers.forEach((peer, uid) => {
           if (!newParticipants.has(uid)) {
             this.removePeer(uid);
+            // Delete signals doc when remote player has left
+            if (roomCode) {
+              deleteDoc(doc(db, 'rooms', roomCode, 'voice_signals', peer.pairId)).catch(() => {});
+            }
           }
         });
       },
@@ -378,25 +407,35 @@ export class VoiceService {
     this.peers.delete(remoteUid);
   }
 
-  private setupPeerForRemoteUser(remoteUid: string) {
-    if (!this.roomCode || !this.currentUser || !this.localStream) return;
+  private setupPeerForRemoteUser(remoteUid: string, remoteSessionId: string) {
+    if (!this.roomCode || !this.currentUser || !this.localStream || !this.currentSessionId) return;
 
     const myUid = this.currentUser.uid;
+    const mySessionId = this.currentSessionId;
     const pairId = this.getPairId(myUid, remoteUid);
     const isInitiator = myUid < remoteUid;
 
     const pc = new RTCPeerConnection(RTC_CONFIG);
+
+    // Audio element configured with autoplay and kept in DOM so browser does not suspend it
     const audio = new Audio();
     audio.autoplay = true;
+    audio.setAttribute('playsinline', 'true');
     audio.muted = this.isDeafened;
+    audio.style.display = 'none';
+    if (typeof document !== 'undefined' && document.body) {
+      document.body.appendChild(audio);
+    }
 
     const peerData: PeerConnectionData = {
       pairId,
       remoteUid,
+      remoteSessionId,
       pc,
       audio,
       candidateQueue: [],
       processedCandidates: new Set<string>(),
+      currentOfferSessionId: isInitiator ? mySessionId : null,
       lastProcessedOfferSdp: null,
       lastProcessedAnswerSdp: null,
       unsubscribePair: null,
@@ -411,8 +450,15 @@ export class VoiceService {
 
     // 2. Play remote audio stream when tracks arrive
     pc.ontrack = (event) => {
+      let stream: MediaStream | null = null;
       if (event.streams && event.streams[0]) {
-        peerData.audio.srcObject = event.streams[0];
+        stream = event.streams[0];
+      } else if (event.track) {
+        stream = new MediaStream([event.track]);
+      }
+
+      if (stream) {
+        peerData.audio.srcObject = stream;
         peerData.audio.play().catch((e) => console.warn('Remote audio play warning:', e));
       }
     };
@@ -431,62 +477,50 @@ export class VoiceService {
             updatedAt: Date.now(),
           });
         } catch {
-          // If pair document does not exist yet, initialize it
-          try {
-            await setDoc(
-              pairDocRef,
-              {
-                pairId,
-                initiatorUid: isInitiator ? myUid : remoteUid,
-                receiverUid: isInitiator ? remoteUid : myUid,
-                [fieldName]: [cand],
-                updatedAt: Date.now(),
-              },
-              { merge: true }
-            );
-          } catch (err: any) {
-            console.warn('Failed to send ICE candidate:', err);
-          }
+          // Document may not exist yet if remote hasn't created it; updateDoc error is ignored
         }
       }
     };
 
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed') {
-        const failMsg = `RTCPeerConnection failed with peer ${remoteUid}`;
-        console.warn(failMsg);
+        console.warn(`RTCPeerConnection failed with peer ${remoteUid}`);
       }
     };
 
-    // 4. Initiator creates the WebRTC offer
+    // 4. Initiator creates the WebRTC offer starting from a clean signaling document (OVERWRITE, NOT MERGE)
     if (isInitiator) {
       pc.createOffer({ offerToReceiveAudio: true })
         .then(async (offer) => {
           await pc.setLocalDescription(offer);
+
+          // Overwrite clean document: merge: false ensures no stale answer or candidates remain from old session
           await setDoc(
             pairDocRef,
             {
               pairId,
               initiatorUid: myUid,
               receiverUid: remoteUid,
+              initiatorSessionId: mySessionId,
+              receiverSessionId: remoteSessionId || null,
+              sessionId: mySessionId,
               offer: {
                 type: offer.type,
                 sdp: offer.sdp,
                 from: myUid,
                 timestamp: Date.now(),
+                sessionId: mySessionId,
               },
+              answer: null,
+              candidatesA: [],
+              candidatesB: [],
               updatedAt: Date.now(),
             },
-            { merge: true }
+            { merge: false }
           );
         })
         .catch((err: any) => {
           console.warn('Create offer error:', err);
-          const rawError = err?.name && err?.message
-            ? `${err.name}: ${err.message}`
-            : (err?.message || String(err));
-          this.error = rawError;
-          this.emitState();
         });
     }
 
@@ -500,15 +534,37 @@ export class VoiceService {
 
         try {
           if (isInitiator) {
-            // Initiator waits for answer
+            // Initiator: ignore any signaling data whose session id is not our current session's
+            if (data.sessionId !== mySessionId) {
+              return;
+            }
+
+            // Guard: apply an answer only in "have-local-offer"
             if (data.answer && data.answer.sdp && data.answer.sdp !== peerData.lastProcessedAnswerSdp) {
+              // Ignore answer if it is not meant for our current session
+              if (data.answer.sessionId && data.answer.sessionId !== mySessionId) {
+                return;
+              }
+
+              if (pc.signalingState !== 'have-local-offer') {
+                // Silently ignore SDP that arrives in the wrong state instead of throwing an error
+                return;
+              }
+
               peerData.lastProcessedAnswerSdp = data.answer.sdp;
-              await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+              try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+              } catch (err) {
+                // Silently ignore if closed or racing
+                return;
+              }
 
               // Drain any queued ICE candidates
               while (peerData.candidateQueue.length > 0) {
                 const cand = peerData.candidateQueue.shift()!;
-                await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(cand));
+                } catch {}
               }
             }
 
@@ -519,7 +575,9 @@ export class VoiceService {
                 if (!peerData.processedCandidates.has(key)) {
                   peerData.processedCandidates.add(key);
                   if (pc.remoteDescription && pc.remoteDescription.type) {
-                    await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                    try {
+                      await pc.addIceCandidate(new RTCIceCandidate(cand));
+                    } catch {}
                   } else {
                     peerData.candidateQueue.push(cand);
                   }
@@ -527,19 +585,41 @@ export class VoiceService {
               }
             }
           } else {
-            // Receiver handles incoming offer
+            // Receiver: handle incoming offer from initiator
             if (data.offer && data.offer.sdp && data.offer.sdp !== peerData.lastProcessedOfferSdp) {
+              const offerSessionId = data.offer.sessionId || data.sessionId;
+
+              // Check if we already processed this session's offer
+              if (peerData.currentOfferSessionId === offerSessionId && peerData.lastProcessedOfferSdp === data.offer.sdp) {
+                return;
+              }
+
+              // Guard: apply an offer only in "stable"
+              if (pc.signalingState !== 'stable') {
+                // Silently ignore SDP that arrives in the wrong state instead of throwing an error
+                return;
+              }
+
               peerData.lastProcessedOfferSdp = data.offer.sdp;
-              await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+              peerData.currentOfferSessionId = offerSessionId;
+
+              try {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+              } catch (err) {
+                // Silently ignore SDP that arrives in the wrong state
+                return;
+              }
 
               // Drain any queued ICE candidates
               while (peerData.candidateQueue.length > 0) {
                 const cand = peerData.candidateQueue.shift()!;
-                await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                try {
+                  await pc.addIceCandidate(new RTCIceCandidate(cand));
+                } catch {}
               }
 
-              // Create and send answer
-              const answer = await pc.createAnswer();
+              // Create and send answer with receive audio
+              const answer = await pc.createAnswer({ offerToReceiveAudio: true });
               await pc.setLocalDescription(answer);
 
               await updateDoc(pairDocRef, {
@@ -548,26 +628,11 @@ export class VoiceService {
                   sdp: answer.sdp,
                   from: myUid,
                   timestamp: Date.now(),
+                  sessionId: offerSessionId,
                 },
+                receiverSessionId: mySessionId,
                 updatedAt: Date.now(),
-              }).catch(async () => {
-                await setDoc(
-                  pairDocRef,
-                  {
-                    pairId,
-                    initiatorUid: remoteUid,
-                    receiverUid: myUid,
-                    answer: {
-                      type: answer.type,
-                      sdp: answer.sdp,
-                      from: myUid,
-                      timestamp: Date.now(),
-                    },
-                    updatedAt: Date.now(),
-                  },
-                  { merge: true }
-                );
-              });
+              }).catch(() => {});
             }
 
             // Ingest candidates from initiator (candidatesA)
@@ -577,7 +642,9 @@ export class VoiceService {
                 if (!peerData.processedCandidates.has(key)) {
                   peerData.processedCandidates.add(key);
                   if (pc.remoteDescription && pc.remoteDescription.type) {
-                    await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+                    try {
+                      await pc.addIceCandidate(new RTCIceCandidate(cand));
+                    } catch {}
                   } else {
                     peerData.candidateQueue.push(cand);
                   }
@@ -586,21 +653,12 @@ export class VoiceService {
             }
           }
         } catch (err: any) {
-          console.warn(`Signaling error with peer ${remoteUid}:`, err);
-          const rawError = err?.name && err?.message
-            ? `${err.name}: ${err.message}`
-            : (err?.message || String(err));
-          this.error = rawError;
-          this.emitState();
+          // Silently ignore unexpected state transitions during signaling
+          console.warn(`Signaling notice with peer ${remoteUid}:`, err);
         }
       },
       (err) => {
-        console.warn(`Signal listener error for pair ${pairId}:`, err);
-        const rawError = err?.name && err?.message
-          ? `${err.name}: ${err.message}`
-          : (err?.message || String(err));
-        this.error = rawError;
-        this.emitState();
+        console.warn(`Signal listener notice for pair ${pairId}:`, err);
       }
     );
   }

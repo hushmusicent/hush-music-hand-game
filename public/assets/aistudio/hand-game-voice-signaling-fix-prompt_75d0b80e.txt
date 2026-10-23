@@ -1,0 +1,7 @@
+Fix the voice signaling session bugs. Symptoms: after leaving voice and rejoining, the banner shows "InvalidStateError: Failed to set remote answer sdp: Called in wrong state: stable", and on a first connect both players show in the call but one side hears no audio. The cause: signaling data from a previous session survives in the room's voice_signals document and gets applied to a brand-new peer connection.
+
+- Stamp each voice join with a session id (use the presence joinedAt or a generated id). Store it in the voice_signals document alongside the offer, answer, and candidates, and ignore any signaling data whose session id is not the current session's.
+- When a player leaves voice, delete their voice_signals documents. When setting up a new peer connection, start from a clean signaling document (overwrite, not merge) so no stale answer or candidates remain.
+- Guard every setRemoteDescription call with the peer connection's signalingState: apply an answer only in "have-local-offer", apply an offer only in "stable". Silently ignore SDP that arrives in the wrong state instead of throwing an error.
+
+Keep everything else the same. Done means: two players join voice, hear each other, leave, rejoin — no error banner, audio both ways. Show me the preview when done.
