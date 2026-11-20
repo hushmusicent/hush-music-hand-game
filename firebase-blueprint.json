@@ -62,12 +62,12 @@
     },
     "User": {
       "title": "User",
-      "description": "Player or guest user profile document.",
+      "description": "Public player or guest user profile document (private credentials live in Firebase Auth).",
       "type": "object",
       "properties": {
         "uid": {
           "type": "string",
-          "description": "Unique identifier of the user",
+          "description": "Firebase Auth unique identifier of the user",
           "maxLength": 128
         },
         "username": {
@@ -75,14 +75,9 @@
           "description": "Display name of the user",
           "maxLength": 64
         },
-        "email": {
-          "type": "string",
-          "description": "User email address",
-          "maxLength": 128
-        },
         "points": {
           "type": "number",
-          "description": "User game tokens / points balance"
+          "description": "User game tokens / points balance (0 to 10,000,000)"
         },
         "wins": {
           "type": "object",
@@ -94,8 +89,8 @@
         },
         "avatar": {
           "type": "string",
-          "description": "Avatar icon or URL string",
-          "maxLength": 128
+          "description": "Avatar icon or image data URL string",
+          "maxLength": 32768
         },
         "lastSeen": {
           "type": "number",

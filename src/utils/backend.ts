@@ -2,6 +2,13 @@ import { User, Room, ChatMessage, Friend, FriendRequest, GameId } from '../types
 import { Storage, STARTING_POINTS, CPU_PAYOUTS, DAILY_BONUS, DAILY_INTERVAL_MS } from './storage';
 import { Sound } from './sound';
 import {
+  auth,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInAnonymously,
+  signOut,
+  updateProfile,
+  deleteUser,
   saveRoomToRTDB,
   getRoomFromRTDB,
   getOpenRoomsFromRTDB,
@@ -11,6 +18,10 @@ import {
   getOpenRoomsFromFirestore,
   deleteRoomFromFirestore,
   subscribeToRoom,
+  savePlayerToFirestore,
+  getPlayerFromFirestore,
+  getAllPlayersFromFirestore,
+  deletePlayerFromFirestore,
   savePlayerToRTDB,
   getPlayerFromRTDB,
   getAllPlayersFromRTDB,
@@ -27,6 +38,36 @@ import {
   getChatMessagesFromRTDB,
   subscribeToChat,
 } from '../firebase';
+
+let authFlowActive = false;
+
+async function getAuthHeaders(): Promise<Record<string, string>> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (auth.currentUser) {
+    try {
+      const token = await auth.currentUser.getIdToken();
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+    } catch {}
+  }
+  return headers;
+}
+
+function formatFirebaseAuthError(err: any, fallback: string): string {
+  const code = err?.code || '';
+  if (code === 'auth/email-already-in-use') return 'This email address is already registered. Please log in instead.';
+  if (code === 'auth/invalid-email') return 'Please enter a valid email address.';
+  if (code === 'auth/weak-password') return 'Password must be at least 6 characters long.';
+  if (code === 'auth/user-not-found' || code === 'auth/wrong-password' || code === 'auth/invalid-credential') {
+    return 'Incorrect email or password. Please try again.';
+  }
+  if (code === 'auth/too-many-requests') return 'Too many login attempts. Please wait a moment and try again.';
+  if (code === 'auth/admin-restricted-operation' || code === 'auth/operation-not-allowed') {
+    return 'Guest anonymous sign-in is disabled in Firebase Console. Enable the Anonymous provider under Authentication → Sign-in method, or sign in with Email/Google.';
+  }
+  return err?.message || fallback;
+}
 
 export interface FirebaseConfig {
   apiKey: string;
@@ -81,7 +122,11 @@ export const Backend = {
     return !!(cfg.apiKey && cfg.projectId);
   },
 
-  // Auth Operations
+  isAuthFlowActive(): boolean {
+    return authFlowActive;
+  },
+
+  // Auth Operations (Firebase Auth primary)
   async signup(username: string, email: string, password: string, avatar?: string): Promise<User> {
     const cleanUser = username.trim();
     const cleanEmail = email.trim().toLowerCase();
@@ -93,59 +138,68 @@ export const Backend = {
     if (!cleanEmail.includes('@') || !cleanEmail.includes('.')) {
       throw new Error('Please enter a valid email address');
     }
-    if (!cleanPassword || cleanPassword.length < 4) {
-      throw new Error('Password must be at least 4 characters long');
+    if (!cleanPassword || cleanPassword.length < 6) {
+      throw new Error('Password must be at least 6 characters long');
     }
 
+    authFlowActive = true;
     try {
-      const res = await fetch('/api/users/signup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: cleanUser, email: cleanEmail, password: cleanPassword, avatar }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const user: User = data.user;
-        Storage.saveUser(user);
-        Storage.setSession(user);
-        savePlayerToRTDB(user).catch(() => {});
-        return user;
-      }
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || 'Signup failed');
-    } catch (err: unknown) {
-      const msg = (err as Error).message || '';
-      if (!msg.includes('Failed to fetch') && !msg.includes('NetworkError') && !msg.includes('fetch')) {
-        throw err;
+      // Check username/email availability on server before creating Firebase Auth account
+      try {
+        const availRes = await fetch('/api/users/check-availability', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: cleanUser, email: cleanEmail }),
+        });
+        if (availRes.status === 409) {
+          const availData = await availRes.json().catch(() => ({}));
+          throw new Error(availData.error || 'Username or email is already registered');
+        }
+      } catch (availErr: any) {
+        if (availErr?.message && (availErr.message.includes('taken') || availErr.message.includes('registered'))) {
+          throw availErr;
+        }
       }
 
-      // Offline fallback
-      if (Storage.getUserByUsername(cleanUser)) {
-        throw new Error('Username already taken');
-      }
-      if (Storage.getUserByEmail(cleanEmail)) {
-        throw new Error('Email is already registered');
-      }
+      const cred = await createUserWithEmailAndPassword(auth, cleanEmail, cleanPassword);
+      await updateProfile(cred.user, { displayName: cleanUser }).catch(() => {});
 
       const newUser: User = {
-        uid: 'u_' + Math.random().toString(36).substring(2, 9),
+        uid: cred.user.uid,
         username: cleanUser,
         email: cleanEmail,
         points: STARTING_POINTS,
         wins: {},
         lastDaily: 0,
-        avatar,
+        avatar: avatar || '🎧',
+        lastSeen: Date.now(),
       };
 
-      // Storage.saveUser hashes password with bcrypt before saving and deletes password field
-      (newUser as any).password = cleanPassword;
+      // Write ONLY public-safe fields to Firestore under /users/{uid}
+      await savePlayerToFirestore(newUser);
+
+      // Register non-password metadata with Express server
+      try {
+        const headers = await getAuthHeaders();
+        await fetch('/api/users/signup', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            uid: cred.user.uid,
+            username: cleanUser,
+            email: cleanEmail,
+            avatar: newUser.avatar,
+          }),
+        });
+      } catch {}
+
       Storage.saveUser(newUser);
       Storage.setSession(newUser);
-      this.syncUser(newUser);
-
-      // Never return password field when reading or returning player data
-      const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = newUser as any;
-      return safeUser as User;
+      return newUser;
+    } catch (err: any) {
+      throw new Error(formatFirebaseAuthError(err, 'Signup failed'));
+    } finally {
+      authFlowActive = false;
     }
   },
 
@@ -159,45 +213,159 @@ export const Backend = {
       throw new Error('Please enter your password');
     }
 
+    authFlowActive = true;
     try {
-      const res = await fetch('/api/users/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: clean, password: cleanPassword }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const user: User = data.user;
-        Storage.saveUser(user);
-        Storage.setSession(user);
-        savePlayerToRTDB(user).catch(() => {});
-        return user;
-      }
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || 'Account not found or password incorrect');
-    } catch (err: unknown) {
-      const msg = (err as Error).message || '';
-      if (!msg.includes('Failed to fetch') && !msg.includes('NetworkError') && !msg.includes('fetch')) {
-        throw err;
-      }
+      let resolvedEmail = clean.includes('@') ? clean.toLowerCase() : '';
+      let needsMigration = false;
+      let legacyUid: string | null = null;
+      let serverUser: Partial<User> | null = null;
 
-      // Offline fallback
-      const cleanLower = clean.toLowerCase();
-      const byEmail = Storage.getUserByEmail(cleanLower);
-      const byUser = Storage.getUserByUsername(cleanLower);
-      const targetUser = byEmail || byUser;
-
-      if (targetUser) {
-        const isValid = Storage.verifyOfflinePassword(clean, cleanPassword);
-        if (!isValid) {
-          throw new Error('Incorrect password. Please try again.');
+      // 1. Check server store for username lookup & legacy bcrypt verification
+      let serverResponded = false;
+      try {
+        const res = await fetch('/api/users/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ identifier: clean, password: cleanPassword }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          serverResponded = true;
+          resolvedEmail = data.email || resolvedEmail;
+          needsMigration = !!data.needsMigration;
+          legacyUid = data.legacyUid || data.user?.uid || null;
+          serverUser = data.user || null;
+        } else if (res.status === 401 || res.status === 400) {
+          // Legacy bcrypt password check failed -> reject immediately
+          throw new Error(data.error || 'Incorrect password. Please try again.');
+        } else if (res.status === 404 && !clean.includes('@')) {
+          throw new Error(data.error || 'Account not found. Please check your credentials or sign up.');
         }
-        Storage.setSession(targetUser);
-        this.syncUser(targetUser);
-        const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = targetUser as any;
-        return safeUser as User;
+      } catch (fetchErr: any) {
+        if (
+          fetchErr?.message &&
+          !fetchErr.message.includes('Failed to fetch') &&
+          !fetchErr.message.includes('NetworkError') &&
+          !fetchErr.message.includes('fetch')
+        ) {
+          throw fetchErr;
+        }
       }
-      throw new Error('Account not found. Please check your credentials or create an account.');
+
+      if (!resolvedEmail) {
+        throw new Error('Account not found. Please enter your registered email address or sign up.');
+      }
+
+      // 2. Authenticate with Firebase Auth (or migrate verified legacy account into Firebase Auth)
+      let credUser = auth.currentUser;
+      if (needsMigration) {
+        try {
+          const cred = await signInWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
+          credUser = cred.user;
+        } catch (signInErr: any) {
+          const code = signInErr?.code || '';
+          if (
+            code === 'auth/user-not-found' ||
+            code === 'auth/invalid-credential' ||
+            code === 'auth/invalid-login-credentials'
+          ) {
+            try {
+              const created = await createUserWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
+              credUser = created.user;
+              if (serverUser?.username) {
+                await updateProfile(credUser, { displayName: serverUser.username }).catch(() => {});
+              }
+            } catch (createErr: any) {
+              if (createErr?.code === 'auth/email-already-in-use') {
+                throw new Error('An account with this email already exists in Firebase Auth with a different password.');
+              }
+              if (createErr?.code === 'auth/weak-password') {
+                throw new Error('Password must be at least 6 characters for Firebase Auth migration. Please use Forgot Password or contact support.');
+              }
+              throw new Error(formatFirebaseAuthError(createErr, 'Failed to migrate account'));
+            }
+          } else {
+            throw new Error(formatFirebaseAuthError(signInErr, 'Sign-in failed'));
+          }
+        }
+      } else {
+        try {
+          const cred = await signInWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
+          credUser = cred.user;
+        } catch (signInErr: any) {
+          throw new Error(formatFirebaseAuthError(signInErr, 'Incorrect email or password. Please try again.'));
+        }
+      }
+
+      if (!credUser) {
+        throw new Error('Authentication failed.');
+      }
+
+      // 3. Load existing Firestore data (both under new Firebase Auth UID and legacy UID if different)
+      const [fsUser, legacyFsUser] = await Promise.all([
+        getPlayerFromFirestore(credUser.uid),
+        legacyUid && legacyUid !== credUser.uid ? getPlayerFromFirestore(legacyUid) : Promise.resolve(null),
+      ]);
+
+      const sourceStats = fsUser || legacyFsUser || serverUser;
+      const mergedWins = {
+        ...(serverUser?.wins || {}),
+        ...(legacyFsUser?.wins || {}),
+        ...(fsUser?.wins || {}),
+      };
+      const mergedPoints =
+        typeof fsUser?.points === 'number'
+          ? fsUser.points
+          : typeof legacyFsUser?.points === 'number'
+          ? legacyFsUser.points
+          : typeof serverUser?.points === 'number'
+          ? serverUser.points
+          : STARTING_POINTS;
+
+      const finalUser: User = {
+        uid: credUser.uid,
+        username:
+          fsUser?.username ||
+          legacyFsUser?.username ||
+          serverUser?.username ||
+          credUser.displayName ||
+          resolvedEmail.split('@')[0] ||
+          'Player',
+        email: credUser.email || resolvedEmail,
+        points: mergedPoints,
+        wins: mergedWins,
+        lastDaily: Math.max(fsUser?.lastDaily || 0, legacyFsUser?.lastDaily || 0, serverUser?.lastDaily || 0),
+        avatar: fsUser?.avatar || legacyFsUser?.avatar || serverUser?.avatar || '🎧',
+        lastSeen: Date.now(),
+      };
+
+      // 4. Write clean public-safe doc to Firestore (overwriting & removing any passwordHash/email fields)
+      await savePlayerToFirestore(finalUser);
+
+      // 5. Complete migration on server (removes passwordHash & re-keys legacyUid -> credUser.uid)
+      if (serverResponded || needsMigration) {
+        try {
+          const headers = await getAuthHeaders();
+          await fetch('/api/users/complete-migration', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              legacyUid,
+              username: finalUser.username,
+              avatar: finalUser.avatar,
+              points: finalUser.points,
+              wins: finalUser.wins,
+              lastDaily: finalUser.lastDaily,
+            }),
+          });
+        } catch {}
+      }
+
+      Storage.saveUser(finalUser);
+      Storage.setSession(finalUser);
+      return finalUser;
+    } finally {
+      authFlowActive = false;
     }
   },
 
@@ -214,40 +382,16 @@ export const Backend = {
       throw new Error('Please enter your username or email address.');
     }
 
-    try {
-      const res = await fetch('/api/users/recover/request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: clean }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to request password recovery.');
-      }
-      return data;
-    } catch (err: unknown) {
-      const msg = (err as Error).message || '';
-      if (!msg.includes('Failed to fetch') && !msg.includes('NetworkError') && !msg.includes('fetch')) {
-        throw err;
-      }
-      // Offline fallback
-      const cleanLower = clean.toLowerCase();
-      const byEmail = Storage.getUserByEmail(cleanLower);
-      const byUser = Storage.getUserByUsername(cleanLower);
-      const target = byEmail || byUser;
-      if (!target) {
-        throw new Error(`No account found for "${identifier}".`);
-      }
-      const code = '123456';
-      return {
-        username: target.username,
-        email: target.email,
-        maskedEmail: target.email ? `${target.email.slice(0, 2)}***@${target.email.split('@')[1]}` : undefined,
-        recoveryCode: code,
-        expiresInSeconds: 900,
-        message: 'Recovery session initiated.',
-      };
+    const res = await fetch('/api/users/recover/request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: clean }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to request password recovery.');
     }
+    return data;
   },
 
   async resetPassword(identifier: string, code: string, newPassword: string): Promise<User> {
@@ -255,123 +399,113 @@ export const Backend = {
     const cleanCode = code.trim();
     const cleanPass = newPassword.trim();
 
-    if (!cleanPass || cleanPass.length < 4) {
-      throw new Error('New password must be at least 4 characters long.');
+    if (!cleanPass || cleanPass.length < 6) {
+      throw new Error('New password must be at least 6 characters long.');
     }
 
-    try {
-      const res = await fetch('/api/users/recover/reset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ identifier: clean, code: cleanCode, newPassword: cleanPass }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to reset password.');
-      }
-      const user: User = data.user;
-      Storage.saveUser(user);
-      Storage.setSession(user);
-      this.syncUser(user);
-      return user;
-    } catch (err: unknown) {
-      const msg = (err as Error).message || '';
-      if (!msg.includes('Failed to fetch') && !msg.includes('NetworkError') && !msg.includes('fetch')) {
-        throw err;
-      }
-      // Offline fallback
-      const cleanLower = clean.toLowerCase();
-      const user = Storage.getUserByEmail(cleanLower) || Storage.getUserByUsername(cleanLower);
-      if (!user) throw new Error('Account not found.');
-      const updated: User = { ...user };
-      (updated as any).password = cleanPass;
-      Storage.saveUser(updated);
-      Storage.setSession(updated);
-      this.syncUser(updated);
-      const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = updated as any;
-      return safeUser as User;
+    const res = await fetch('/api/users/recover/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier: clean, code: cleanCode, newPassword: cleanPass }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to reset password.');
     }
+    const emailToUse = data.user?.email || (clean.includes('@') ? clean : '');
+    if (emailToUse) {
+      return this.login(emailToUse, cleanPass);
+    }
+    const user: User = data.user;
+    Storage.saveUser(user);
+    Storage.setSession(user);
+    return user;
   },
 
-  async googleAuth(displayName: string, email: string, avatar?: string): Promise<User> {
+  async googleAuth(uid: string, displayName: string, email: string, avatar?: string): Promise<User> {
     const cleanEmail = email.trim().toLowerCase();
+    authFlowActive = true;
     try {
-      const res = await fetch('/api/users/google-auth', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ displayName, email: cleanEmail, avatar }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const user: User = data.user;
-        Storage.saveUser(user);
-        Storage.setSession(user);
-        savePlayerToRTDB(user).catch(() => {});
-        return user;
-      }
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || 'Google sign-in failed');
-    } catch (err: unknown) {
-      const msg = (err as Error).message || '';
-      if (!msg.includes('Failed to fetch') && !msg.includes('NetworkError') && !msg.includes('fetch')) {
-        throw err;
-      }
+      const existingFs = await getPlayerFromFirestore(uid);
+      let serverUser: Partial<User> | null = null;
+      try {
+        const headers = await getAuthHeaders();
+        const res = await fetch('/api/users/google-auth', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ uid, displayName, email: cleanEmail, avatar }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          serverUser = data.user;
+        }
+      } catch {}
 
-      // Offline fallback
-      const existing = Storage.getUserByEmail(cleanEmail);
-      if (existing) {
-        Storage.setSession(existing);
-        savePlayerToRTDB(existing).catch(() => {});
-        return existing;
-      }
-      const newUser: User = {
-        uid: 'u_' + Math.random().toString(36).substring(2, 9),
-        username: (displayName || cleanEmail.split('@')[0] || 'Player').trim(),
+      const finalUser: User = {
+        uid,
+        username: existingFs?.username || serverUser?.username || (displayName || cleanEmail.split('@')[0] || 'Player').trim(),
         email: cleanEmail,
-        points: STARTING_POINTS,
-        wins: {},
-        lastDaily: 0,
-        avatar,
+        points: typeof existingFs?.points === 'number'
+          ? existingFs.points
+          : (typeof serverUser?.points === 'number' ? serverUser.points : STARTING_POINTS),
+        wins: existingFs?.wins || serverUser?.wins || {},
+        lastDaily: existingFs?.lastDaily || serverUser?.lastDaily || 0,
+        avatar: existingFs?.avatar || serverUser?.avatar || avatar || '🎧',
+        lastSeen: Date.now(),
       };
-      Storage.saveUser(newUser);
-      Storage.setSession(newUser);
-      savePlayerToRTDB(newUser).catch(() => {});
-      return newUser;
+
+      await savePlayerToFirestore(finalUser);
+      Storage.saveUser(finalUser);
+      Storage.setSession(finalUser);
+      return finalUser;
+    } finally {
+      authFlowActive = false;
     }
   },
 
   async loginGuest(avatar?: string): Promise<User> {
+    authFlowActive = true;
     try {
-      const res = await fetch('/api/users/guest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ avatar }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const guestUser: User = data.user;
-        Storage.saveUser(guestUser);
-        Storage.setSession(guestUser);
-        savePlayerToRTDB(guestUser).catch(() => {});
-        return guestUser;
-      }
-    } catch {}
+      const cred = await signInAnonymously(auth);
+      const randNum = Math.floor(1000 + Math.random() * 9000);
+      const existingFs = await getPlayerFromFirestore(cred.user.uid);
 
-    const randNum = Math.floor(1000 + Math.random() * 9000);
-    const guestUser: User = {
-      uid: 'guest_' + Math.random().toString(36).substring(2, 9),
-      username: `HushPlayer_${randNum}`,
-      email: `player_${randNum}@hushmusic.internal`,
-      points: STARTING_POINTS,
-      wins: {},
-      lastDaily: 0,
-      avatar,
-    };
-    Storage.saveUser(guestUser);
-    Storage.setSession(guestUser);
-    this.syncUser(guestUser);
-    savePlayerToRTDB(guestUser).catch(() => {});
-    return guestUser;
+      const guestUser: User = existingFs
+        ? { ...existingFs, email: '' }
+        : {
+            uid: cred.user.uid,
+            username: `HushPlayer_${randNum}`,
+            email: '',
+            points: STARTING_POINTS,
+            wins: {},
+            lastDaily: 0,
+            avatar: avatar || '🎧',
+            lastSeen: Date.now(),
+          };
+
+      await savePlayerToFirestore(guestUser);
+
+      try {
+        const headers = await getAuthHeaders();
+        await fetch('/api/users/guest', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            uid: guestUser.uid,
+            username: guestUser.username,
+            avatar: guestUser.avatar,
+          }),
+        });
+      } catch {}
+
+      Storage.saveUser(guestUser);
+      Storage.setSession(guestUser);
+      return guestUser;
+    } catch (err: any) {
+      throw new Error(formatFirebaseAuthError(err, 'Guest sign-in failed'));
+    } finally {
+      authFlowActive = false;
+    }
   },
 
   updateUser(user: User): User {
@@ -381,6 +515,7 @@ export const Backend = {
   },
 
   async logout(): Promise<void> {
+    await signOut(auth).catch(() => {});
     Storage.setSession(null);
   },
 
@@ -462,21 +597,22 @@ export const Backend = {
   },
 
   async getLeaderboardAsync(): Promise<User[]> {
+    const map = new Map<string, User>();
+    const local = Storage.getUsers();
+    for (const u of Object.values(local)) {
+      if (u) {
+        map.set(u.uid, {
+          ...u,
+          points: typeof u.points === 'number' ? u.points : 1000,
+          wins: u.wins || {},
+        });
+      }
+    }
+
     try {
       const res = await fetch('/api/users');
       if (res.ok) {
         const serverUsers: User[] = await res.json();
-        const local = Storage.getUsers();
-        const map = new Map<string, User>();
-        for (const u of Object.values(local)) {
-          if (u) {
-            map.set(u.uid, {
-              ...u,
-              points: typeof u.points === 'number' ? u.points : 1000,
-              wins: u.wins || {},
-            });
-          }
-        }
         for (const u of serverUsers) {
           if (u) {
             map.set(u.uid, {
@@ -486,12 +622,27 @@ export const Backend = {
             });
           }
         }
-        return Array.from(map.values())
-          .sort((a, b) => (b.points || 0) - (a.points || 0))
-          .slice(0, 50);
       }
     } catch {}
-    return this.getLeaderboard();
+
+    if (auth.currentUser) {
+      try {
+        const fsUsers = await getAllPlayersFromFirestore();
+        for (const u of fsUsers) {
+          if (u) {
+            map.set(u.uid, {
+              ...u,
+              points: typeof u.points === 'number' ? u.points : 1000,
+              wins: u.wins || {},
+            });
+          }
+        }
+      } catch {}
+    }
+
+    return Array.from(map.values())
+      .sort((a, b) => (b.points || 0) - (a.points || 0))
+      .slice(0, 50);
   },
 
   // Multiplayer Rooms with Firebase Firestore
@@ -1141,26 +1292,38 @@ export const Backend = {
 
   syncUser(user: User): void {
     const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = user as any;
-    savePlayerToRTDB(safeUser as User).catch(() => {});
-    try {
-      fetch('/api/users/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user: safeUser }),
-      }).catch(() => {});
-    } catch {}
+    if (auth.currentUser && auth.currentUser.uid === user.uid) {
+      savePlayerToFirestore(safeUser as User).catch(() => {});
+      getAuthHeaders()
+        .then((headers) =>
+          fetch('/api/users/sync', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ user: safeUser }),
+          })
+        )
+        .catch(() => {});
+    }
   },
 
   async deleteUserAccount(identifier: string): Promise<boolean> {
-    deletePlayerFromRTDB(identifier).catch(() => {});
+    if (auth.currentUser && auth.currentUser.uid === identifier) {
+      await deletePlayerFromFirestore(identifier).catch(() => {});
+    }
     try {
+      const headers = await getAuthHeaders();
       Storage.deleteUser(identifier);
       const res = await fetch('/api/users/delete', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ identifier }),
       });
       const data = await res.json().catch(() => ({}));
+      if (auth.currentUser && auth.currentUser.uid === identifier) {
+        await deleteUser(auth.currentUser).catch(async () => {
+          await signOut(auth).catch(() => {});
+        });
+      }
       return !!data.ok;
     } catch {
       Storage.deleteUser(identifier);

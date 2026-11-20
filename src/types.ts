@@ -23,6 +23,7 @@ export interface User {
   lastDaily: number;
   avatar?: string;
   password?: string;
+  lastSeen?: number;
 }
 
 export interface Room {

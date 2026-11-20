@@ -1,5 +1,14 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
+import {
+  getAuth,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInAnonymously,
+  signOut,
+  onAuthStateChanged,
+  updateProfile,
+  deleteUser,
+} from 'firebase/auth';
 import {
   getFirestore,
   doc,
@@ -22,7 +31,6 @@ import {
   onValue as rtdbOnValue,
   Database,
 } from 'firebase/database';
-import bcrypt from 'bcryptjs';
 import firebaseConfig from '../firebase-applet-config.json';
 import { Room, GameId, User, FriendRequest, ChatMessage } from './types';
 
@@ -38,6 +46,15 @@ export const rtdb: Database | null =
     : null;
 
 export const auth = getAuth(app);
+export {
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  signInAnonymously,
+  signOut,
+  onAuthStateChanged,
+  updateProfile,
+  deleteUser,
+};
 
 // Error handling types & helpers per specification
 export enum OperationType {
@@ -116,33 +133,30 @@ export async function savePlayerToFirestore(player: User): Promise<void> {
     return;
   }
 
+  // Only allow authenticated users to write their own Firestore user document
+  if (!auth.currentUser || auth.currentUser.uid !== player.uid) {
+    return;
+  }
+
+  const rawPoints = typeof player.points === 'number' && Number.isFinite(player.points) ? player.points : 1000;
+  const clampedPoints = Math.min(10_000_000, Math.max(0, Math.floor(rawPoints)));
+
+  // Store ONLY public-safe fields (never email or passwordHash)
   const payload: Record<string, any> = {
     uid: player.uid,
-    username: player.username,
-    email: player.email || '',
-    points: typeof player.points === 'number' ? player.points : 1000,
-    wins: player.wins || {},
-    lastDaily: player.lastDaily || 0,
-    avatar: player.avatar || '🎧',
+    username: String(player.username || 'Player').trim().slice(0, 64) || 'Player',
+    points: clampedPoints,
+    wins: player.wins && typeof player.wins === 'object' ? player.wins : {},
+    lastDaily: typeof player.lastDaily === 'number' && player.lastDaily >= 0 ? player.lastDaily : 0,
+    avatar: String(player.avatar || '🎧').slice(0, 32768),
     lastSeen: Date.now(),
   };
 
-  // Hash password with bcrypt before saving if provided
-  const rawPass = (player as any).password;
-  if (rawPass && typeof rawPass === 'string') {
-    payload.passwordHash = rawPass.startsWith('$2')
-      ? rawPass
-      : bcrypt.hashSync(rawPass, 10);
-  } else if ((player as any).passwordHash) {
-    payload.passwordHash = (player as any).passwordHash;
-  }
-  delete payload.password;
-  delete payload.passwordSalt;
-
   try {
+    // Overwrite without merge so any legacy email/passwordHash fields are completely removed
     await setDoc(doc(db, 'users', player.uid), payload);
   } catch (err) {
-    // Non-blocking fallback
+    handleFirestoreError(err, OperationType.WRITE, `users/${player.uid}`);
   }
 
   if (rtdb) {
@@ -159,16 +173,19 @@ export async function savePlayerToFirestore(player: User): Promise<void> {
 export const savePlayerToRTDB = savePlayerToFirestore;
 
 export async function getPlayerFromFirestore(uid: string): Promise<User | null> {
-  if (!uid) return null;
+  if (!uid || !auth.currentUser) return null;
   try {
     const snap = await getDoc(doc(db, 'users', uid));
     if (snap.exists()) {
       const raw = snap.data();
       const { password, passwordHash, passwordSalt, ...safeUser } = raw as any;
-      return safeUser as User;
+      return {
+        ...safeUser,
+        email: auth.currentUser.uid === uid ? (auth.currentUser.email || '') : '',
+      } as User;
     }
-  } catch {
-    // Non-blocking
+  } catch (err) {
+    console.warn('Firestore player read notice:', err);
   }
   if (rtdb) {
     try {
@@ -187,26 +204,30 @@ export async function getPlayerFromFirestore(uid: string): Promise<User | null> 
 export const getPlayerFromRTDB = getPlayerFromFirestore;
 
 export async function getAllPlayersFromFirestore(): Promise<User[]> {
+  if (!auth.currentUser) return [];
   try {
     const snap = await getDocs(collection(db, 'users'));
     return snap.docs
       .map((d) => d.data())
       .filter((u: any) => u && u.uid !== 'u_zbs0jd0' && u.username?.toLowerCase() !== 'kingveno')
       .map((u: any) => {
-        const { password, passwordHash, passwordSalt, ...safeUser } = u;
-        return safeUser as User;
+        const { password, passwordHash, passwordSalt, email: _e, ...safeUser } = u;
+        return { ...safeUser, email: '' } as User;
       });
-  } catch {
+  } catch (err) {
+    console.warn('Firestore players list notice:', err);
     return [];
   }
 }
 export const getAllPlayersFromRTDB = getAllPlayersFromFirestore;
 
 export async function deletePlayerFromFirestore(uid: string): Promise<void> {
-  if (!uid) return;
+  if (!uid || !auth.currentUser || auth.currentUser.uid !== uid) return;
   try {
     await deleteDoc(doc(db, 'users', uid));
-  } catch {}
+  } catch (err) {
+    console.warn('Firestore player delete notice:', err);
+  }
   if (rtdb) {
     try {
       await Promise.all([
@@ -222,6 +243,10 @@ export async function deletePlayerFromFirestore(uid: string): Promise<void> {
 export const deletePlayerFromRTDB = deletePlayerFromFirestore;
 
 export function subscribeToPlayers(onUpdate: (players: User[]) => void): () => void {
+  if (!auth.currentUser) {
+    onUpdate([]);
+    return () => {};
+  }
   try {
     return onSnapshot(
       collection(db, 'users'),
@@ -230,8 +255,8 @@ export function subscribeToPlayers(onUpdate: (players: User[]) => void): () => v
           .map((d) => d.data())
           .filter((u: any) => u && u.uid !== 'u_zbs0jd0' && u.username?.toLowerCase() !== 'kingveno')
           .map((u: any) => {
-            const { password, passwordHash, passwordSalt, ...safeUser } = u;
-            return safeUser as User;
+            const { password, passwordHash, passwordSalt, email: _e, ...safeUser } = u;
+            return { ...safeUser, email: '' } as User;
           });
         onUpdate(list);
       },

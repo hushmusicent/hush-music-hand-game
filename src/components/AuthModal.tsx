@@ -105,8 +105,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
       setError('Please choose a password');
       return;
     }
-    if (signupPassword.length < 4) {
-      setError('Password must be at least 4 characters long');
+    if (signupPassword.length < 6) {
+      setError('Password must be at least 6 characters long');
       return;
     }
     if (signupPassword !== signupConfirmPassword) {
@@ -138,7 +138,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
       const email = googleUser.email || `${googleUser.uid}@google.com`;
       const photo = googleUser.photoURL || avatar;
 
-      const u = await Backend.googleAuth(displayName, email, photo);
+      const u = await Backend.googleAuth(googleUser.uid, displayName, email, photo);
       Sound.jackpot();
       onSuccess(u);
     } catch (err: unknown) {
@@ -205,8 +205,8 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
       setError('Please enter your new password');
       return;
     }
-    if (newPassword.length < 4) {
-      setError('Password must be at least 4 characters long');
+    if (newPassword.length < 6) {
+      setError('Password must be at least 6 characters long');
       return;
     }
     if (newPassword !== confirmNewPassword) {
@@ -426,7 +426,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
 
               <div>
                 <label className="text-xs font-semibold text-slate-400 block mb-1">
-                  New Password (min 4 characters)
+                  New Password (min 6 characters)
                 </label>
                 <div className="relative">
                   <input
@@ -687,7 +687,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ onSuccess }) => {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <div>
                 <label className="text-xs font-semibold text-slate-400 block mb-1">
-                  Password (min. 4 chars)
+                  Password (min. 6 chars)
                 </label>
                 <div className="relative">
                   <input

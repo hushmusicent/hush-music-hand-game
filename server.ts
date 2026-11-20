@@ -32,23 +32,48 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json({ limit: '2mb' }));
 
-// Initialize Firebase Firestore & Realtime Database for cross-device shared persistence
+// Initialize Firebase configuration for ID token verification & optional RTDB
 let firestoreDb: Firestore | null = null;
 let rtdb: Database | null = null;
+let firebaseApiKey = '';
 try {
   const configFile = path.resolve(__dirname, 'firebase-applet-config.json');
   if (fs.existsSync(configFile)) {
     const firebaseConfig = JSON.parse(fs.readFileSync(configFile, 'utf-8'));
+    firebaseApiKey = firebaseConfig.apiKey || '';
     const fbApp = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
     const rtdbUrl = firebaseConfig.databaseURL;
     if (typeof rtdbUrl === 'string' && rtdbUrl.trim().length > 0 && !rtdbUrl.includes('default-rtdb')) {
       rtdb = getDatabase(fbApp, rtdbUrl.trim());
       console.log('Firebase Realtime Database initialized on backend server!');
     }
-    console.log('Firebase Firestore successfully initialized on backend server!');
+    console.log('Firebase configuration loaded on backend server!');
   }
 } catch (err) {
   console.warn('Could not initialize Firebase in server:', err);
+}
+
+async function verifyFirebaseToken(authHeader?: string): Promise<{ uid: string; email?: string } | null> {
+  if (!authHeader || !authHeader.startsWith('Bearer ') || !firebaseApiKey) return null;
+  const idToken = authHeader.slice(7).trim();
+  if (!idToken) return null;
+  try {
+    const resp = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseApiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      }
+    );
+    if (!resp.ok) return null;
+    const data: any = await resp.json();
+    const acct = Array.isArray(data.users) ? data.users[0] : null;
+    if (!acct || !acct.localId) return null;
+    return { uid: acct.localId, email: acct.email || undefined };
+  } catch {
+    return null;
+  }
 }
 
 // Data storage with file persistence (user accounts, friends, chat)
@@ -429,21 +454,16 @@ function loadStore() {
       });
   }
 
-  // Sync initial state (players and rooms) to Firebase Firestore
-  setTimeout(() => {
-    if (firestoreDb) {
-      for (const u of users.values()) syncPlayerToRTDB(u).catch(() => {});
-      for (const r of rooms.values()) syncRoomToFirestore(r).catch(() => {});
-    }
-    if (rtdb) {
+  if (rtdb) {
+    setTimeout(() => {
       for (const u of users.values()) syncPlayerToRTDB(u).catch(() => {});
       for (const [uid, fset] of friendsMap.entries()) syncFriendsToRTDB(uid, Array.from(fset)).catch(() => {});
       for (const [targetUid, reqs] of requestsMap.entries()) {
         for (const r of reqs) syncFriendRequestToRTDB(targetUid, r).catch(() => {});
       }
       console.log('Synchronized players and rooms to Firebase Realtime Database.');
-    }
-  }, 1000);
+    }, 1000);
+  }
 }
 
 loadStore();
@@ -597,7 +617,18 @@ function verifyPassword(password: string, storedHashOrLegacyHash: string, salt?:
 
 function sanitizeUser(u: any) {
   if (!u) return null;
-  // Never return password, passwordHash, or passwordSalt when reading player data
+  // Never return private credentials or email on public endpoints
+  const { password, passwordHash, passwordSalt, email, ...safe } = u;
+  return {
+    ...safe,
+    points: typeof safe.points === 'number' ? safe.points : 1000,
+    wins: safe.wins || {},
+    avatar: safe.avatar || '🎧',
+  };
+}
+
+function sanitizeSelfUser(u: any) {
+  if (!u) return null;
   const { password, passwordHash, passwordSalt, ...safe } = u;
   return {
     ...safe,
@@ -735,10 +766,30 @@ app.post('/api/users/recover/reset', (req, res) => {
   });
 });
 
+app.post('/api/users/check-availability', (req, res) => {
+  const { username, email } = req.body || {};
+  const cleanUser = String(username || '').trim().toLowerCase();
+  const cleanEmail = String(email || '').trim().toLowerCase();
+
+  for (const u of users.values()) {
+    if (!u) continue;
+    if (cleanUser && u.username && u.username.trim().toLowerCase() === cleanUser) {
+      return res.status(409).json({ available: false, error: 'Username already taken' });
+    }
+    if (cleanEmail && u.email && u.email.trim().toLowerCase() === cleanEmail) {
+      return res.status(409).json({ available: false, error: 'Email is already registered' });
+    }
+  }
+  res.json({ available: true });
+});
+
 app.post('/api/users/login', (req, res) => {
   const { identifier, password } = req.body;
   if (!identifier || !identifier.trim()) {
     return res.status(400).json({ error: 'Please enter your username or email.' });
+  }
+  if (!password || !password.trim()) {
+    return res.status(400).json({ error: 'Please enter your password.' });
   }
 
   const clean = identifier.trim().toLowerCase();
@@ -753,183 +804,267 @@ app.post('/api/users/login', (req, res) => {
 
   if (!found) {
     return res.status(404).json({
+      notFound: true,
       error: `Account "${identifier}" not found. Please check your spelling or sign up.`,
     });
   }
 
-  if (!password || !password.trim()) {
-    return res.status(400).json({ error: 'Please enter your password.' });
-  }
+  const fallbackHandle = (found.username || 'player').toLowerCase().replace(/[^a-z0-9]/g, '') || 'player';
+  const resolvedEmail = found.email && found.email.includes('@')
+    ? found.email.trim().toLowerCase()
+    : `${fallbackHandle}@hushmusic.internal`;
 
-  // If user already has a password set, verify it
+  // If unmigrated account has a stored bcrypt/legacy passwordHash, verify against it FIRST
   if (found.passwordHash) {
     const isCorrect = verifyPassword(password, found.passwordHash, found.passwordSalt);
     if (!isCorrect) {
       return res.status(401).json({ error: 'Incorrect password. Please try again.' });
     }
-    // Automatically upgrade legacy sha256 hashes to bcrypt on successful login
-    if (!found.passwordHash.startsWith('$2')) {
-      found.passwordHash = hashPassword(password);
-      delete found.passwordSalt;
-      delete (found as any).password;
-      users.set(found.uid, found);
-      persistStore();
-    }
-  } else {
-    // If existing account was created prior to password requirement, set their password now on login
-    found.passwordHash = hashPassword(password);
-    delete found.passwordSalt;
-    delete (found as any).password;
-    users.set(found.uid, found);
-    persistStore();
+    return res.json({
+      ok: true,
+      needsMigration: true,
+      email: resolvedEmail,
+      legacyUid: found.uid,
+      user: sanitizeSelfUser(found),
+    });
   }
 
-  // Check and deliver any pending invites for this user
-  deliverPendingInvites(found);
-  persistStore();
-  syncPlayerToRTDB(found).catch(() => {});
+  // Already migrated to Firebase Auth: return email so client signs in with Firebase Auth directly
+  if (found.migratedToAuth) {
+    return res.json({
+      ok: true,
+      needsMigration: false,
+      email: resolvedEmail,
+      legacyUid: found.uid,
+      user: sanitizeSelfUser(found),
+    });
+  }
 
-  res.json({ ok: true, user: sanitizeUser(found) });
+  // Legacy pre-password account without passwordHash: allow migration to Firebase Auth on login
+  return res.json({
+    ok: true,
+    needsMigration: true,
+    legacyNoPassword: true,
+    email: resolvedEmail,
+    legacyUid: found.uid,
+    user: sanitizeSelfUser(found),
+  });
 });
 
-app.post('/api/users/signup', (req, res) => {
-  const { username, email, password, avatar } = req.body;
-  if (!username || !username.trim() || !email || !email.trim()) {
-    return res.status(400).json({ error: 'Username and email are required.' });
+app.post('/api/users/complete-migration', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
+  if (!verified) {
+    return res.status(401).json({ error: 'Valid Firebase Auth token required.' });
   }
 
-  if (!password || password.trim().length < 4) {
-    return res.status(400).json({ error: 'Password must be at least 4 characters long.' });
+  const { legacyUid, username, avatar, points, wins, lastDaily } = req.body || {};
+  const fbUid = verified.uid;
+  const legacyUser = legacyUid ? users.get(legacyUid) : undefined;
+  const existingFbUser = users.get(fbUid);
+
+  const mergedUser: any = {
+    ...(legacyUser || {}),
+    ...(existingFbUser || {}),
+    uid: fbUid,
+    username: username || existingFbUser?.username || legacyUser?.username || 'Player',
+    email: verified.email || existingFbUser?.email || legacyUser?.email || '',
+    points: typeof points === 'number'
+      ? points
+      : (existingFbUser?.points ?? legacyUser?.points ?? 1000),
+    wins: wins || existingFbUser?.wins || legacyUser?.wins || {},
+    lastDaily: typeof lastDaily === 'number'
+      ? lastDaily
+      : (existingFbUser?.lastDaily ?? legacyUser?.lastDaily ?? 0),
+    avatar: avatar || existingFbUser?.avatar || legacyUser?.avatar || '🎧',
+    migratedToAuth: true,
+    lastSeen: Date.now(),
+  };
+
+  // Permanently remove passwordHash from server store once Firebase Auth holds credentials
+  delete mergedUser.passwordHash;
+  delete mergedUser.passwordSalt;
+  delete mergedUser.password;
+
+  if (legacyUid && legacyUid !== fbUid) {
+    users.delete(legacyUid);
+
+    // Re-key social relationships from legacyUid to fbUid
+    const oldFriends = friendsMap.get(legacyUid);
+    if (oldFriends) {
+      if (!friendsMap.has(fbUid)) friendsMap.set(fbUid, new Set());
+      for (const fUid of oldFriends) {
+        friendsMap.get(fbUid)!.add(fUid);
+        const reverse = friendsMap.get(fUid);
+        if (reverse && reverse.has(legacyUid)) {
+          reverse.delete(legacyUid);
+          reverse.add(fbUid);
+        }
+      }
+      friendsMap.delete(legacyUid);
+    }
+
+    const oldReqs = requestsMap.get(legacyUid);
+    if (oldReqs) {
+      const currentReqs = requestsMap.get(fbUid) || [];
+      requestsMap.set(fbUid, [...currentReqs, ...oldReqs.map((r) => ({ ...r, targetUid: fbUid }))]);
+      requestsMap.delete(legacyUid);
+    }
+  }
+
+  users.set(fbUid, mergedUser);
+  deliverPendingInvites(mergedUser);
+  persistStore(true);
+
+  res.json({ ok: true, user: sanitizeSelfUser(mergedUser) });
+});
+
+app.post('/api/users/signup', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
+  const { uid: bodyUid, username, email, avatar } = req.body || {};
+  const uid = verified?.uid || bodyUid;
+
+  if (!uid || !username || !username.trim()) {
+    return res.status(400).json({ error: 'Authenticated UID and username are required.' });
+  }
+  if (verified && bodyUid && verified.uid !== bodyUid) {
+    return res.status(403).json({ error: 'UID mismatch with authenticated token.' });
   }
 
   const cleanUser = username.trim();
-  const cleanEmail = email.trim().toLowerCase();
+  const cleanEmail = (verified?.email || email || '').trim().toLowerCase();
 
-  // Check if username or email already exists
-  const allUsers = Array.from(users.values());
-  let existing = allUsers.find((u) => {
-    if (!u) return false;
-    return (
-      (u.username && u.username.trim().toLowerCase() === cleanUser.toLowerCase()) ||
-      (u.email && u.email.trim().toLowerCase() === cleanEmail)
-    );
-  });
-
+  const existing = users.get(uid);
   if (existing) {
-    // If account exists, verify password before allowing login
-    if (existing.passwordHash) {
-      if (!verifyPassword(password, existing.passwordHash, existing.passwordSalt)) {
-        return res.status(400).json({
-          error: 'An account with this username or email already exists with a different password.',
-        });
-      }
-      // Upgrade to bcrypt if needed
-      if (!existing.passwordHash.startsWith('$2')) {
-        existing.passwordHash = hashPassword(password);
-        delete existing.passwordSalt;
-        delete (existing as any).password;
-      }
-    } else {
-      // Set password for existing legacy account
-      existing.passwordHash = hashPassword(password);
-      delete existing.passwordSalt;
-      delete (existing as any).password;
-    }
-
+    existing.username = cleanUser;
+    if (cleanEmail) existing.email = cleanEmail;
     if (avatar) existing.avatar = avatar;
+    existing.migratedToAuth = true;
+    delete existing.passwordHash;
+    delete existing.passwordSalt;
+    delete existing.password;
     existing.lastSeen = Date.now();
-    users.set(existing.uid, existing);
-    deliverPendingInvites(existing);
-    persistStore();
-    syncPlayerToRTDB(existing).catch(() => {});
-    return res.json({ ok: true, user: sanitizeUser(existing), isExisting: true });
+    users.set(uid, existing);
+    persistStore(true);
+    return res.json({ ok: true, user: sanitizeSelfUser(existing), isExisting: true });
   }
 
-  const hash = hashPassword(password);
-  const newUid = `u_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
   const newUser = {
-    uid: newUid,
+    uid,
     username: cleanUser,
     email: cleanEmail,
-    passwordHash: hash,
     points: 1000,
     wins: {},
     lastDaily: 0,
     avatar: avatar || '🎧',
+    migratedToAuth: true,
     lastSeen: Date.now(),
   };
 
-  users.set(newUid, newUser);
+  users.set(uid, newUser);
   deliverPendingInvites(newUser);
   persistStore(true);
-  syncPlayerToRTDB(newUser).catch(() => {});
 
-  res.json({ ok: true, user: sanitizeUser(newUser) });
+  res.json({ ok: true, user: sanitizeSelfUser(newUser) });
 });
 
-app.post('/api/users/google-auth', (req, res) => {
-  const { displayName, email, avatar } = req.body;
-  if (!email || !email.trim()) {
-    return res.status(400).json({ error: 'Google email is required.' });
+app.post('/api/users/google-auth', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
+  const { uid: bodyUid, displayName, email, avatar } = req.body || {};
+  const uid = verified?.uid || bodyUid;
+  const cleanEmail = (verified?.email || email || '').trim().toLowerCase();
+
+  if (!uid || !cleanEmail) {
+    return res.status(400).json({ error: 'Authenticated Google UID and email are required.' });
+  }
+  if (verified && bodyUid && verified.uid !== bodyUid) {
+    return res.status(403).json({ error: 'UID mismatch with authenticated token.' });
   }
 
-  const cleanEmail = email.trim().toLowerCase();
-  const allUsers = Array.from(users.values());
-  let existing = allUsers.find((u) => u && u.email && u.email.trim().toLowerCase() === cleanEmail);
+  let existing = users.get(uid);
+  let legacyMatch: any = null;
+  if (!existing) {
+    legacyMatch = Array.from(users.values()).find((u) => u && u.email && u.email.trim().toLowerCase() === cleanEmail);
+  }
 
   if (existing) {
     if (avatar && (!existing.avatar || existing.avatar === '🎧')) {
       existing.avatar = avatar;
     }
+    existing.migratedToAuth = true;
+    delete existing.passwordHash;
+    delete existing.passwordSalt;
     existing.lastSeen = Date.now();
-    users.set(existing.uid, existing);
+    users.set(uid, existing);
     deliverPendingInvites(existing);
-    persistStore();
-    syncPlayerToRTDB(existing).catch(() => {});
-    return res.json({ ok: true, user: sanitizeUser(existing) });
+    persistStore(true);
+    return res.json({ ok: true, user: sanitizeSelfUser(existing) });
   }
 
-  const cleanUser = (displayName || cleanEmail.split('@')[0] || 'Player').trim();
-  const newUid = `u_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+  const cleanUser = (legacyMatch?.username || displayName || cleanEmail.split('@')[0] || 'Player').trim();
   const newUser = {
-    uid: newUid,
+    ...(legacyMatch || {}),
+    uid,
     username: cleanUser,
     email: cleanEmail,
-    points: 1000,
-    wins: {},
-    lastDaily: 0,
-    avatar: avatar || '🎧',
+    points: typeof legacyMatch?.points === 'number' ? legacyMatch.points : 1000,
+    wins: legacyMatch?.wins || {},
+    lastDaily: legacyMatch?.lastDaily || 0,
+    avatar: legacyMatch?.avatar || avatar || '🎧',
     isGoogleAuth: true,
+    migratedToAuth: true,
     lastSeen: Date.now(),
   };
+  delete (newUser as any).passwordHash;
+  delete (newUser as any).passwordSalt;
+  delete (newUser as any).password;
 
-  users.set(newUid, newUser);
+  if (legacyMatch && legacyMatch.uid !== uid) {
+    users.delete(legacyMatch.uid);
+  }
+
+  users.set(uid, newUser);
   deliverPendingInvites(newUser);
   persistStore(true);
-  syncPlayerToRTDB(newUser).catch(() => {});
 
-  res.json({ ok: true, user: sanitizeUser(newUser) });
+  res.json({ ok: true, user: sanitizeSelfUser(newUser) });
 });
 
-app.post('/api/users/guest', (req, res) => {
-  const { avatar } = req.body;
+app.post('/api/users/guest', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
+  const { uid: bodyUid, username, avatar } = req.body || {};
+  const guestUid = verified?.uid || bodyUid;
+  if (!guestUid) {
+    return res.status(400).json({ error: 'Firebase Anonymous Auth UID is required.' });
+  }
+  if (verified && bodyUid && verified.uid !== bodyUid) {
+    return res.status(403).json({ error: 'UID mismatch with authenticated token.' });
+  }
+
+  const existing = users.get(guestUid);
+  if (existing) {
+    existing.lastSeen = Date.now();
+    users.set(guestUid, existing);
+    persistStore();
+    return res.json({ ok: true, user: sanitizeSelfUser(existing) });
+  }
+
   const randNum = Math.floor(1000 + Math.random() * 9000);
-  const guestUid = `guest_${Date.now().toString(36)}_${randNum}`;
   const guestUser = {
     uid: guestUid,
-    username: `HushPlayer_${randNum}`,
-    email: `player_${randNum}@hushmusic.internal`,
+    username: username || `HushPlayer_${randNum}`,
+    email: '',
     points: 1000,
     wins: {},
     lastDaily: 0,
     avatar: avatar || '🎧',
+    migratedToAuth: true,
+    isAnonymous: true,
     lastSeen: Date.now(),
   };
 
   users.set(guestUid, guestUser);
   persistStore();
-  syncPlayerToRTDB(guestUser).catch(() => {});
-  res.json({ ok: true, user: sanitizeUser(guestUser) });
+  res.json({ ok: true, user: sanitizeSelfUser(guestUser) });
 });
 
 function deliverPendingInvites(user: { uid: string; username: string; email?: string }) {
@@ -1100,11 +1235,15 @@ function eraseUserAccount(identifier: string): boolean {
   return true;
 }
 
-app.post('/api/users/delete', (req, res) => {
+app.post('/api/users/delete', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
   const { identifier, uid, email, username } = req.body || {};
-  const target = identifier || uid || email || username;
-  if (!target) {
-    return res.status(400).json({ error: 'Identifier is required to erase user.' });
+  const target = verified?.uid || identifier || uid || email || username;
+  if (!verified) {
+    return res.status(401).json({ error: 'Authentication required to erase account.' });
+  }
+  if (identifier && identifier !== verified.uid) {
+    return res.status(403).json({ error: 'You may only erase your own account.' });
   }
   const success = eraseUserAccount(target);
   if (success) {
@@ -1113,8 +1252,15 @@ app.post('/api/users/delete', (req, res) => {
   return res.status(404).json({ error: `Account "${target}" not found.` });
 });
 
-app.delete('/api/users/:identifier', (req, res) => {
+app.delete('/api/users/:identifier', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
   const { identifier } = req.params;
+  if (!verified) {
+    return res.status(401).json({ error: 'Authentication required to erase account.' });
+  }
+  if (identifier !== verified.uid) {
+    return res.status(403).json({ error: 'You may only erase your own account.' });
+  }
   const success = eraseUserAccount(identifier);
   if (success) {
     return res.json({ ok: true, message: `Account "${identifier}" was permanently erased.` });
@@ -1122,10 +1268,13 @@ app.delete('/api/users/:identifier', (req, res) => {
   return res.status(404).json({ error: `Account "${identifier}" not found.` });
 });
 
-app.post('/api/users/sync', (req, res) => {
-  const { user } = req.body;
+app.post('/api/users/sync', async (req, res) => {
+  const verified = await verifyFirebaseToken(req.headers.authorization);
+  const { user } = req.body || {};
   if (user && user.uid) {
-    const cleanEmail = (user.email || '').toLowerCase().trim();
+    if (!verified || verified.uid !== user.uid) {
+      return res.status(401).json({ error: 'Authenticated token required for profile sync.' });
+    }
     const cleanName = (user.username || '').toLowerCase().trim();
     if (
       user.uid === 'u_zbs0jd0' ||
@@ -1136,17 +1285,21 @@ app.post('/api/users/sync', (req, res) => {
     }
     const existing = users.get(user.uid) || {};
     const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = user;
+    const rawPoints = typeof safeUser.points === 'number' && Number.isFinite(safeUser.points) ? safeUser.points : (existing.points ?? 1000);
     const updated = {
       ...existing,
       ...safeUser,
-      passwordHash: existing.passwordHash,
-      passwordSalt: existing.passwordSalt,
+      uid: verified.uid,
+      email: verified.email || existing.email || safeUser.email || '',
+      points: Math.min(10_000_000, Math.max(0, Math.floor(rawPoints))),
       lastSeen: Date.now(),
     };
+    delete updated.passwordHash;
+    delete updated.passwordSalt;
+    delete updated.password;
     users.set(user.uid, updated);
     deliverPendingInvites(updated);
     persistStore(true);
-    syncPlayerToRTDB(updated).catch(() => {});
   }
   res.json({ ok: true });
 });

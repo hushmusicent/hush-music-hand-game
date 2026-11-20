@@ -1,5 +1,4 @@
 import { User, Room, ChatMessage, FriendRequest } from '../types';
-import bcrypt from 'bcryptjs';
 
 export const STARTING_POINTS = 1000;
 export const DAILY_BONUS = 500;
@@ -54,7 +53,6 @@ export const Storage = {
       ) {
         continue;
       }
-      // Never return the password, passwordHash, or passwordSalt field when reading player data
       const { password, passwordHash, passwordSalt, ...safeUser } = u;
       cleanUsers[uid] = safeUser as User;
     }
@@ -87,68 +85,23 @@ export const Storage = {
 
   saveUser(user: User) {
     const rawUsers = getStored<Record<string, any>>(STORAGE_KEYS.USERS, {});
-    const userToSave: Record<string, any> = { ...user };
-
-    // Hash password with bcrypt before saving if provided
-    const rawPass = (userToSave as any).password;
-    if (rawPass && typeof rawPass === 'string') {
-      userToSave.passwordHash = rawPass.startsWith('$2')
-        ? rawPass
-        : bcrypt.hashSync(rawPass, 10);
-      delete userToSave.password;
-    } else if ((user as any).passwordHash) {
-      userToSave.passwordHash = (user as any).passwordHash;
-      delete userToSave.password;
-    }
-
-    rawUsers[user.uid] = userToSave;
+    const { password: _p, passwordHash: _ph, passwordSalt: _ps, ...safeUser } = user as any;
+    rawUsers[user.uid] = safeUser;
     setStored(STORAGE_KEYS.USERS, rawUsers);
 
-    // Never store or keep password in session when reading/updating session
     if (this.getSession()?.uid === user.uid) {
-      const { password, passwordHash, passwordSalt, ...safeUser } = userToSave;
       this.setSession(safeUser as User);
     }
   },
 
   getUserByEmail(email: string): User | undefined {
     const users = this.getUsers();
-    return Object.values(users).find((u) => u.email.toLowerCase() === email.toLowerCase());
+    return Object.values(users).find((u) => (u.email || '').toLowerCase() === email.toLowerCase());
   },
 
   getUserByUsername(username: string): User | undefined {
     const users = this.getUsers();
-    return Object.values(users).find((u) => u.username.toLowerCase() === username.toLowerCase());
-  },
-
-  // Secure offline password verification without exposing password on player reads
-  verifyOfflinePassword(identifier: string, rawPassword: string): boolean {
-    const rawUsers = getStored<Record<string, any>>(STORAGE_KEYS.USERS, {});
-    const clean = identifier.trim().toLowerCase();
-    const found = Object.values(rawUsers).find(
-      (u) =>
-        u &&
-        (u.email?.toLowerCase() === clean ||
-          u.username?.toLowerCase() === clean)
-    );
-    if (!found) return false;
-    const storedHash = found.passwordHash || (found.password && found.password.startsWith('$2') ? found.password : null);
-    if (storedHash) {
-      try {
-        return bcrypt.compareSync(rawPassword, storedHash);
-      } catch {
-        return false;
-      }
-    }
-    // Backward compatibility for legacy plain text passwords in offline store: upgrade to bcrypt
-    if (found.password && found.password === rawPassword) {
-      found.passwordHash = bcrypt.hashSync(rawPassword, 10);
-      delete found.password;
-      rawUsers[found.uid] = found;
-      setStored(STORAGE_KEYS.USERS, rawUsers);
-      return true;
-    }
-    return false;
+    return Object.values(users).find((u) => (u.username || '').toLowerCase() === username.toLowerCase());
   },
 
   getSession(): User | null {

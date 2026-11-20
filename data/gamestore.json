@@ -127,6 +127,16 @@
       "lastDaily": 0,
       "avatar": "🎧",
       "lastSeen": 1792735280806
+    },
+    "guest_mvfsd02u_3130": {
+      "uid": "guest_mvfsd02u_3130",
+      "username": "HushPlayer_3130",
+      "email": "player_3130@hushmusic.internal",
+      "points": 1000,
+      "wins": {},
+      "lastDaily": 0,
+      "avatar": "🎧",
+      "lastSeen": 1795217261466
     }
   },
   "chat": {},
@@ -139,7 +149,8 @@
     "u_tester_phone": [],
     "u_mv000y2j_lni4": [],
     "u_mv08i1u1_fjf3": [],
-    "u_mv08pw3u_ovta": []
+    "u_mv08pw3u_ovta": [],
+    "guest_mvfsd02u_3130": []
   },
   "pendingInvites": {}
 }

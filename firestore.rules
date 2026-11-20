@@ -7,32 +7,35 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function isValidUser(data) {
       return data.keys().hasAll(['uid', 'username'])
-        && data.keys().hasOnly(['uid', 'username', 'email', 'points', 'wins', 'lastDaily', 'avatar', 'lastSeen'])
-        && data.uid is string && data.uid.size() <= 128
-        && data.username is string && data.username.size() <= 64
-        && (!('email' in data) || (data.email is string && data.email.size() <= 128))
-        && (!('points' in data) || data.points is number)
+        && data.keys().hasOnly(['uid', 'username', 'points', 'wins', 'lastDaily', 'avatar', 'lastSeen'])
+        && data.uid is string && data.uid.size() >= 1 && data.uid.size() <= 128
+        && data.username is string && data.username.size() >= 1 && data.username.size() <= 64
+        && (!('points' in data) || (data.points is number && data.points >= 0 && data.points <= 10000000))
         && (!('wins' in data) || data.wins is map)
-        && (!('lastDaily' in data) || data.lastDaily is number)
-        && (!('avatar' in data) || (data.avatar is string && data.avatar.size() <= 128))
-        && (!('lastSeen' in data) || data.lastSeen is number);
+        && (!('lastDaily' in data) || (data.lastDaily is number && data.lastDaily >= 0))
+        && (!('avatar' in data) || (data.avatar is string && data.avatar.size() <= 32768))
+        && (!('lastSeen' in data) || (data.lastSeen is number && data.lastSeen >= 0));
     }
 
     function isValidRoom(data) {
       return data.keys().hasAll(['code', 'game', 'seatsNeeded', 'seats', 'host', 'status'])
         && data.keys().hasOnly(['code', 'game', 'seatsNeeded', 'seats', 'names', 'avatars', 'turn', 'status', 'host', 'created', 'state', 'updatedAt'])
-        && data.code is string && data.code.size() <= 32
-        && data.game is string && data.game.size() <= 32
+        && data.code is string && data.code.size() >= 1 && data.code.size() <= 32
+        && data.game is string && data.game.size() >= 1 && data.game.size() <= 32
         && data.seatsNeeded is number && data.seatsNeeded >= 1 && data.seatsNeeded <= 8
         && data.seats is list && data.seats.size() <= 8
         && data.status in ['waiting', 'playing', 'done']
-        && data.host is string && data.host.size() <= 128
+        && data.host is string && data.host.size() >= 1 && data.host.size() <= 128
         && (!('turn' in data) || data.turn is number)
         && (!('names' in data) || data.names is map)
         && (!('avatars' in data) || data.avatars is map)
@@ -41,42 +44,95 @@ service cloud.firestore {
         && (!('state' in data) || data.state == null || data.state is map);
     }
 
-    // Health check collection for connection testing
-    match /test/{docId} {
-      allow read, write: if isValidId(docId);
+    function isRoomMember(roomData) {
+      return isSignedIn() && (
+        roomData.host == request.auth.uid
+        || request.auth.uid in roomData.seats
+      );
     }
 
-    // User profiles
+    function isValidRoomJoin() {
+      return isSignedIn()
+        && resource.data.status != 'done'
+        && resource.data.seats.size() < resource.data.seatsNeeded
+        && request.resource.data.host == resource.data.host
+        && request.resource.data.code == resource.data.code
+        && request.resource.data.game == resource.data.game
+        && request.resource.data.seatsNeeded == resource.data.seatsNeeded
+        && !(request.auth.uid in resource.data.seats)
+        && request.auth.uid in request.resource.data.seats
+        && request.resource.data.seats.hasAll(resource.data.seats)
+        && request.resource.data.seats.size() == resource.data.seats.size() + 1
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seats', 'names', 'avatars', 'status', 'updatedAt']);
+    }
+
+    function isRoomPlayer(roomId) {
+      let roomPath = /databases/$(database)/documents/rooms/$(roomId);
+      return isSignedIn()
+        && isValidId(roomId)
+        && exists(roomPath)
+        && (
+          get(roomPath).data.host == request.auth.uid
+          || request.auth.uid in get(roomPath).data.seats
+        );
+    }
+
+    // Health check collection: read-only, no public writes
+    match /test/{docId} {
+      allow get: if isValidId(docId);
+      allow list, create, update, delete: if false;
+    }
+
+    // Public user profiles (no email or passwordHash allowed)
     match /users/{userId} {
-      allow get: if isValidId(userId);
-      allow list: if true;
-      allow create, update: if isValidId(userId)
+      allow get: if isSignedIn() && isValidId(userId);
+      allow list: if isSignedIn();
+      allow create, update: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId
         && isValidUser(request.resource.data)
         && request.resource.data.uid == userId;
-      allow delete: if isValidId(userId);
+      allow delete: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId;
     }
 
     // Multiplayer game rooms
     match /rooms/{roomId} {
-      allow get: if isValidId(roomId);
-      allow list: if true;
-      allow create: if isValidId(roomId)
+      allow get: if isSignedIn() && isValidId(roomId);
+      allow list: if isSignedIn();
+      allow create: if isSignedIn()
+        && isValidId(roomId)
         && isValidRoom(request.resource.data)
-        && request.resource.data.code == roomId;
-      allow update: if isValidId(roomId)
-        && isValidRoom(request.resource.data);
-      allow delete: if isValidId(roomId);
+        && request.resource.data.code == roomId
+        && request.resource.data.host == request.auth.uid
+        && request.auth.uid in request.resource.data.seats;
+      allow update: if isSignedIn()
+        && isValidId(roomId)
+        && isValidRoom(request.resource.data)
+        && request.resource.data.code == roomId
+        && request.resource.data.host == resource.data.host
+        && (isRoomMember(resource.data) || isValidRoomJoin());
+      allow delete: if isSignedIn()
+        && isValidId(roomId)
+        && resource.data.host == request.auth.uid;
 
       // WebRTC voice signaling per player pair
       match /voice_signals/{pairId} {
-        allow get, list: if isValidId(roomId);
-        allow create, update, delete: if isValidId(roomId) && isValidId(pairId);
+        allow get, list: if isRoomPlayer(roomId);
+        allow create, update, delete: if isRoomPlayer(roomId) && isValidId(pairId);
       }
 
       // WebRTC voice presence per participant
       match /voice_presence/{userId} {
-        allow get, list: if isValidId(roomId);
-        allow create, update, delete: if isValidId(roomId) && isValidId(userId);
+        allow get, list: if isRoomPlayer(roomId);
+        allow create, update: if isRoomPlayer(roomId)
+          && isValidId(userId)
+          && request.auth.uid == userId;
+        allow delete: if isValidId(roomId)
+          && isValidId(userId)
+          && isSignedIn()
+          && (isRoomPlayer(roomId) || request.auth.uid == userId);
       }
     }
   }

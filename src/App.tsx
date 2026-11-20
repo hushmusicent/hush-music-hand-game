@@ -17,6 +17,7 @@ import { Storage } from './utils/storage';
 import { Backend } from './utils/backend';
 import { Sound } from './utils/sound';
 import { ALL_GAMES } from './utils/gamesData';
+import { auth, onAuthStateChanged, getPlayerFromFirestore } from './firebase';
 import { Header } from './components/Header';
 import { BottomNav } from './components/BottomNav';
 import { AuthModal } from './components/AuthModal';
@@ -43,7 +44,9 @@ import { RummyGame } from './components/games/RummyGame';
 import { MahjongGame } from './components/games/MahjongGame';
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(() => Storage.getSession());
+  const [user, setUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const userRef = React.useRef<User | null>(null);
   const [currentView, setCurrentView] = useState<ViewType>('home');
   const [selectedGame, setSelectedGame] = useState<GameMetadata | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>('All');
@@ -63,6 +66,10 @@ export default function App() {
   const [copiedCodeBanner, setCopiedCodeBanner] = useState<boolean>(false);
 
   useEffect(() => {
+    userRef.current = user;
+  }, [user]);
+
+  useEffect(() => {
     // Tick every second to keep live countdowns and reset timers accurate
     const timer = setInterval(() => {
       setNow(Date.now());
@@ -71,22 +78,81 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Session check on load
-    const saved = Storage.getSession();
-    if (saved) {
-      const cleanEmail = (saved.email || '').toLowerCase().trim();
-      const cleanName = (saved.username || '').toLowerCase().trim();
-      if (
-        cleanName === 'kingveno' ||
-        saved.uid === 'u_zbs0jd0'
-      ) {
+    const unsubscribe = onAuthStateChanged(auth, async (fbUser) => {
+      if (Backend.isAuthFlowActive()) {
+        setAuthReady(true);
+        return;
+      }
+
+      if (!fbUser) {
         Storage.setSession(null);
         setUser(null);
-      } else {
-        setUser(saved);
-        Backend.syncUser(saved);
+        setAuthReady(true);
+        return;
       }
-    }
+
+      if (userRef.current?.uid === fbUser.uid) {
+        setAuthReady(true);
+        return;
+      }
+
+      const saved = Storage.getSession();
+      const cleanName = (saved?.username || fbUser.displayName || '').toLowerCase().trim();
+      if (cleanName === 'kingveno' || fbUser.uid === 'u_zbs0jd0') {
+        await Backend.logout();
+        setUser(null);
+        setAuthReady(true);
+        return;
+      }
+
+      const fsProfile = await getPlayerFromFirestore(fbUser.uid).catch(() => null);
+      if (Backend.isAuthFlowActive() || userRef.current?.uid === fbUser.uid) {
+        setAuthReady(true);
+        return;
+      }
+
+      const restored: User = fsProfile
+        ? {
+            ...fsProfile,
+            uid: fbUser.uid,
+            email: fbUser.email || (saved?.uid === fbUser.uid ? saved.email : '') || '',
+            points:
+              typeof fsProfile.points === 'number'
+                ? fsProfile.points
+                : saved?.uid === fbUser.uid
+                ? saved.points
+                : 1000,
+            wins: fsProfile.wins || (saved?.uid === fbUser.uid ? saved.wins : {}),
+            lastDaily:
+              fsProfile.lastDaily ?? (saved?.uid === fbUser.uid ? saved.lastDaily : 0),
+            avatar:
+              fsProfile.avatar ||
+              (saved?.uid === fbUser.uid ? saved.avatar : '🎧') ||
+              '🎧',
+          }
+        : saved && saved.uid === fbUser.uid
+        ? { ...saved, email: fbUser.email || saved.email || '' }
+        : {
+            uid: fbUser.uid,
+            username:
+              fbUser.displayName ||
+              fbUser.email?.split('@')[0] ||
+              (fbUser.isAnonymous ? `HushPlayer_${fbUser.uid.slice(0, 4)}` : 'Player'),
+            email: fbUser.email || '',
+            points: 1000,
+            wins: {},
+            lastDaily: 0,
+            avatar: '🎧',
+            lastSeen: Date.now(),
+          };
+
+      Storage.saveUser(restored);
+      Storage.setSession(restored);
+      setUser(restored);
+      setAuthReady(true);
+    });
+
+    return () => unsubscribe();
   }, []);
 
   // Poll friend requests count for red badge
@@ -105,6 +171,7 @@ export default function App() {
 
   // Check URL query parameters for ?room=XXXX or #room=XXXX to auto-join
   useEffect(() => {
+    if (!authReady) return;
     try {
       const params = new URLSearchParams(window.location.search);
       const hashMatch = window.location.hash.match(/(?:room|join)[=:]\s*([a-zA-Z0-9]+)/i);
@@ -115,17 +182,19 @@ export default function App() {
       window.history.replaceState(null, '', window.location.pathname);
 
       if (!user) {
-        Backend.loginGuest().then((guest) => {
-          setUser(guest);
-          Backend.joinRoom(guest, roomParam, true)
-            .then((room) => {
-              handleRoomJoined(room);
-              Sound.cardDeal();
-            })
-            .catch(() => {
-              setIsPvPOpen(true);
-            });
-        });
+        Backend.loginGuest()
+          .then((guest) => {
+            setUser(guest);
+            Backend.joinRoom(guest, roomParam, true)
+              .then((room) => {
+                handleRoomJoined(room);
+                Sound.cardDeal();
+              })
+              .catch(() => {
+                setIsPvPOpen(true);
+              });
+          })
+          .catch(() => {});
         return;
       }
 
@@ -138,7 +207,7 @@ export default function App() {
           setIsPvPOpen(true);
         });
     } catch {}
-  }, [user?.uid]);
+  }, [authReady, user?.uid]);
 
   // Listen for in-app room join events (e.g. from chat invite buttons)
   useEffect(() => {
@@ -340,10 +409,20 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans pb-20 md:pb-8 selection:bg-amber-400 selection:text-slate-950">
-      {/* Auth Screen Modal if no active session */}
-      {!user && <AuthModal onSuccess={(u) => setUser(u)} />}
+      {/* Loading gate while Firebase Auth resolves persisted session */}
+      {!authReady ? (
+        <div className="flex-1 flex items-center justify-center p-6">
+          <div className="flex flex-col items-center gap-3 text-slate-400 text-xs">
+            <div className="w-8 h-8 rounded-full border-2 border-amber-500/30 border-t-amber-400 animate-spin" />
+            <span>Restoring session...</span>
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* Auth Screen Modal if no active session */}
+          {!user && <AuthModal onSuccess={(u) => setUser(u)} />}
 
-      {user && (
+          {user && (
         <>
           {/* Top Header */}
           <Header
@@ -824,6 +903,8 @@ export default function App() {
             seatsNeeded={selectedGame?.seats || 2}
             onRoomJoined={handleRoomJoined}
           />
+        </>
+      )}
         </>
       )}
     </div>
