@@ -1,3 +1,4 @@
+import bcrypt from 'bcryptjs';
 import { User, Room, ChatMessage, Friend, FriendRequest, GameId } from '../types';
 import { Storage, STARTING_POINTS, CPU_PAYOUTS, DAILY_BONUS, DAILY_INTERVAL_MS } from './storage';
 import { Sound } from './sound';
@@ -21,6 +22,7 @@ import {
   savePlayerToFirestore,
   getPlayerFromFirestore,
   getAllPlayersFromFirestore,
+  findLegacyPlayerDocForMigration,
   deletePlayerFromFirestore,
   savePlayerToRTDB,
   getPlayerFromRTDB,
@@ -220,48 +222,190 @@ export const Backend = {
       let legacyUid: string | null = null;
       let serverUser: Partial<User> | null = null;
 
-      // 1. Check server store for username lookup & legacy bcrypt verification
+      // 1. Check server store for username lookup & legacy bcrypt verification (untouched when /api server responds)
       let serverResponded = false;
+      let serverFailed = false;
       try {
         const res = await fetch('/api/users/login', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ identifier: clean, password: cleanPassword }),
         });
-        const data = await res.json().catch(() => ({}));
-        if (res.ok) {
+        const data = await res.json().catch(() => null);
+        const isValidServerJson =
+          data && typeof data === 'object' && ('ok' in data || 'error' in data || 'notFound' in data);
+
+        if (res.ok && data?.ok) {
           serverResponded = true;
           resolvedEmail = data.email || resolvedEmail;
           needsMigration = !!data.needsMigration;
           legacyUid = data.legacyUid || data.user?.uid || null;
           serverUser = data.user || null;
-        } else if (res.status === 401 || res.status === 400) {
-          // Legacy bcrypt password check failed -> reject immediately
+        } else if ((res.status === 401 || res.status === 400) && isValidServerJson) {
+          // Legacy bcrypt password check failed on server -> reject immediately
           throw new Error(data.error || 'Incorrect password. Please try again.');
-        } else if (res.status === 404 && !clean.includes('@')) {
-          throw new Error(data.error || 'Account not found. Please check your credentials or sign up.');
+        } else if (res.status === 404 && data?.notFound) {
+          if (!clean.includes('@')) {
+            throw new Error(data.error || 'Account not found. Please check your credentials or sign up.');
+          }
+          serverResponded = true;
+        } else {
+          // No /api server (static HTML fallback, 404/405/5xx without Express JSON)
+          serverFailed = true;
         }
       } catch (fetchErr: any) {
         if (
           fetchErr?.message &&
           !fetchErr.message.includes('Failed to fetch') &&
           !fetchErr.message.includes('NetworkError') &&
-          !fetchErr.message.includes('fetch')
+          !fetchErr.message.includes('Network request failed') &&
+          !fetchErr.message.includes('Load failed') &&
+          !fetchErr.message.includes('ERR_') &&
+          !fetchErr.message.toLowerCase().includes('fetch') &&
+          !fetchErr.message.toLowerCase().includes('abort')
         ) {
           throw fetchErr;
+        }
+        serverFailed = true;
+      }
+
+      // Helper for no-server / phone-app client-side legacy lookup & bcrypt verification
+      let signedInAnonForLookup = false;
+      const cleanupTempAnon = async () => {
+        if (signedInAnonForLookup && auth.currentUser?.isAnonymous) {
+          const anonUser = auth.currentUser;
+          signedInAnonForLookup = false;
+          await deleteUser(anonUser).catch(async () => {
+            await signOut(auth).catch(() => {});
+          });
+        }
+      };
+
+      const lookupAndVerifyLegacyFromFirestore = async (requireHash: boolean): Promise<boolean> => {
+        if (!auth.currentUser) {
+          try {
+            await signInAnonymously(auth);
+            signedInAnonForLookup = true;
+          } catch (anonErr: any) {
+            throw new Error(
+              formatFirebaseAuthError(anonErr, 'Unable to sign in anonymously for account lookup.')
+            );
+          }
+        }
+
+        const legacyDoc = await findLegacyPlayerDocForMigration(clean);
+        if (!legacyDoc) {
+          return false;
+        }
+
+        if (legacyDoc.passwordHash) {
+          let passwordMatches = false;
+          try {
+            passwordMatches = bcrypt.compareSync(cleanPassword, legacyDoc.passwordHash);
+          } catch {
+            passwordMatches = false;
+          }
+          if (!passwordMatches) {
+            await cleanupTempAnon();
+            throw new Error('Incorrect email or password');
+          }
+
+          const handle =
+            (legacyDoc.username || 'player').toLowerCase().replace(/[^a-z0-9]/g, '') || 'player';
+          const docEmail =
+            legacyDoc.email && legacyDoc.email.includes('@')
+              ? legacyDoc.email.trim().toLowerCase()
+              : `${handle}@hushmusic.internal`;
+
+          resolvedEmail = docEmail;
+          needsMigration = true;
+          legacyUid = legacyDoc.uid;
+          serverUser = {
+            uid: legacyDoc.uid,
+            username: legacyDoc.username,
+            email: docEmail,
+            points: legacyDoc.points,
+            wins: legacyDoc.wins,
+            lastDaily: legacyDoc.lastDaily,
+            avatar: legacyDoc.avatar,
+          };
+          return true;
+        }
+
+        if (requireHash) {
+          return false;
+        }
+
+        if (!legacyDoc.email) {
+          await cleanupTempAnon();
+          throw new Error(
+            'This account has already been migrated. Please log in with your email address.'
+          );
+        }
+
+        resolvedEmail = legacyDoc.email.trim().toLowerCase();
+        legacyUid = legacyDoc.uid;
+        serverUser = {
+          uid: legacyDoc.uid,
+          username: legacyDoc.username,
+          email: resolvedEmail,
+          points: legacyDoc.points,
+          wins: legacyDoc.wins,
+          lastDaily: legacyDoc.lastDaily,
+          avatar: legacyDoc.avatar,
+        };
+        return true;
+      };
+
+      // Client-side username lookup fallback when /api/users/login is unavailable
+      if (serverFailed && !clean.includes('@')) {
+        const matched = await lookupAndVerifyLegacyFromFirestore(false);
+        if (!matched) {
+          await cleanupTempAnon();
+          throw new Error('Account not found. Please check your credentials or sign up.');
         }
       }
 
       if (!resolvedEmail) {
+        await cleanupTempAnon();
         throw new Error('Account not found. Please enter your registered email address or sign up.');
       }
 
+      // Clean up temporary anonymous lookup user before permanent Email/Password auth
+      await cleanupTempAnon();
+
       // 2. Authenticate with Firebase Auth (or migrate verified legacy account into Firebase Auth)
-      let credUser = auth.currentUser;
+      let credUser = auth.currentUser && !auth.currentUser.isAnonymous ? auth.currentUser : null;
+      const createMigratedFirebaseUser = async () => {
+        try {
+          const created = await createUserWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
+          credUser = created.user;
+          if (serverUser?.username) {
+            await updateProfile(credUser, { displayName: serverUser.username }).catch(() => {});
+          }
+        } catch (createErr: any) {
+          await cleanupTempAnon();
+          if (createErr?.code === 'auth/email-already-in-use') {
+            throw new Error(
+              'An account with this email already exists in Firebase Auth with a different password.'
+            );
+          }
+          if (createErr?.code === 'auth/weak-password') {
+            throw new Error(
+              'Password must be at least 6 characters for Firebase Auth migration. Please use Forgot Password or contact support.'
+            );
+          }
+          throw new Error(formatFirebaseAuthError(createErr, 'Failed to migrate account'));
+        }
+      };
+
       if (needsMigration) {
         try {
           const cred = await signInWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
           credUser = cred.user;
+          if (serverUser?.username && !credUser.displayName) {
+            await updateProfile(credUser, { displayName: serverUser.username }).catch(() => {});
+          }
         } catch (signInErr: any) {
           const code = signInErr?.code || '';
           if (
@@ -269,22 +413,9 @@ export const Backend = {
             code === 'auth/invalid-credential' ||
             code === 'auth/invalid-login-credentials'
           ) {
-            try {
-              const created = await createUserWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
-              credUser = created.user;
-              if (serverUser?.username) {
-                await updateProfile(credUser, { displayName: serverUser.username }).catch(() => {});
-              }
-            } catch (createErr: any) {
-              if (createErr?.code === 'auth/email-already-in-use') {
-                throw new Error('An account with this email already exists in Firebase Auth with a different password.');
-              }
-              if (createErr?.code === 'auth/weak-password') {
-                throw new Error('Password must be at least 6 characters for Firebase Auth migration. Please use Forgot Password or contact support.');
-              }
-              throw new Error(formatFirebaseAuthError(createErr, 'Failed to migrate account'));
-            }
+            await createMigratedFirebaseUser();
           } else {
+            await cleanupTempAnon();
             throw new Error(formatFirebaseAuthError(signInErr, 'Sign-in failed'));
           }
         }
@@ -293,11 +424,32 @@ export const Backend = {
           const cred = await signInWithEmailAndPassword(auth, resolvedEmail, cleanPassword);
           credUser = cred.user;
         } catch (signInErr: any) {
-          throw new Error(formatFirebaseAuthError(signInErr, 'Incorrect email or password. Please try again.'));
+          const code = signInErr?.code || '';
+          const canTryClientEmailMigration =
+            serverFailed &&
+            (code === 'auth/user-not-found' ||
+              code === 'auth/invalid-credential' ||
+              code === 'auth/invalid-login-credentials');
+
+          if (canTryClientEmailMigration) {
+            const matched = await lookupAndVerifyLegacyFromFirestore(true);
+            await cleanupTempAnon();
+            if (matched && needsMigration) {
+              await createMigratedFirebaseUser();
+            } else {
+              throw new Error('Incorrect email or password');
+            }
+          } else {
+            await cleanupTempAnon();
+            throw new Error(
+              formatFirebaseAuthError(signInErr, 'Incorrect email or password. Please try again.')
+            );
+          }
         }
       }
 
-      if (!credUser) {
+      if (!credUser || credUser.isAnonymous) {
+        await cleanupTempAnon();
         throw new Error('Authentication failed.');
       }
 
@@ -307,7 +459,6 @@ export const Backend = {
         legacyUid && legacyUid !== credUser.uid ? getPlayerFromFirestore(legacyUid) : Promise.resolve(null),
       ]);
 
-      const sourceStats = fsUser || legacyFsUser || serverUser;
       const mergedWins = {
         ...(serverUser?.wins || {}),
         ...(legacyFsUser?.wins || {}),

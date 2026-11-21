@@ -221,6 +221,67 @@ export async function getAllPlayersFromFirestore(): Promise<User[]> {
 }
 export const getAllPlayersFromRTDB = getAllPlayersFromFirestore;
 
+export interface LegacyMigrationCandidate {
+  uid: string;
+  username: string;
+  email?: string;
+  passwordHash?: string;
+  passwordSalt?: string;
+  points: number;
+  wins: Record<string, number>;
+  lastDaily: number;
+  avatar: string;
+}
+
+export async function findLegacyPlayerDocForMigration(
+  identifier: string
+): Promise<LegacyMigrationCandidate | null> {
+  if (!auth.currentUser || !identifier || !identifier.trim()) return null;
+  const cleanLower = identifier.trim().toLowerCase();
+  const isEmailLookup = cleanLower.includes('@');
+
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    const matches: LegacyMigrationCandidate[] = [];
+
+    for (const d of snap.docs) {
+      const raw = d.data() as Record<string, any>;
+      if (!raw) continue;
+      const uid = String(raw.uid || d.id);
+      const username = String(raw.username || '').trim();
+      if (uid === 'u_zbs0jd0' || username.toLowerCase() === 'kingveno') continue;
+
+      const emailMatch = isEmailLookup && String(raw.email || '').trim().toLowerCase() === cleanLower;
+      const userMatch = !isEmailLookup && username.toLowerCase() === cleanLower;
+
+      if (emailMatch || userMatch) {
+        matches.push({
+          uid,
+          username: username || 'Player',
+          email: typeof raw.email === 'string' ? raw.email.trim().toLowerCase() : undefined,
+          passwordHash: typeof raw.passwordHash === 'string' ? raw.passwordHash : undefined,
+          passwordSalt: typeof raw.passwordSalt === 'string' ? raw.passwordSalt : undefined,
+          points: typeof raw.points === 'number' && Number.isFinite(raw.points) ? raw.points : 1000,
+          wins: raw.wins && typeof raw.wins === 'object' ? raw.wins : {},
+          lastDaily: typeof raw.lastDaily === 'number' ? raw.lastDaily : 0,
+          avatar: typeof raw.avatar === 'string' && raw.avatar ? raw.avatar : '🎧',
+        });
+      }
+    }
+
+    if (matches.length === 0) return null;
+    return (
+      matches.find((m) => Boolean(m.passwordHash && m.email)) ||
+      matches.find((m) => Boolean(m.passwordHash)) ||
+      matches.find((m) => Boolean(m.email)) ||
+      matches[0]
+    );
+  } catch (err) {
+    console.warn('Firestore legacy lookup notice:', err);
+    return null;
+  }
+}
+
 export async function deletePlayerFromFirestore(uid: string): Promise<void> {
   if (!uid || !auth.currentUser || auth.currentUser.uid !== uid) return;
   try {

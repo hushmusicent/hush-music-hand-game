@@ -1,0 +1,10 @@
+Fix a gap in the Firebase Auth migration: in the phone app there is no /api server, so the login migration never triggers there. Right now, a legacy player logging in from the app with their username gets "Account not found", and with their email gets "Incorrect email or password", because the username-to-email lookup and the bcrypt check both happen server-side, and the Auth-account creation only runs when the server says needsMigration.
+
+Add a client-side migration fallback that runs when the /api/users/login call fails (no server):
+- Sign the user in anonymously first if not already signed in, so the app can read user documents.
+- Find the legacy account by username: list the user documents and match the username (case-insensitive).
+- Verify the typed password against that document's stored bcrypt hash using bcryptjs in the browser. If it does not match, reject with "Incorrect email or password" and do not create anything.
+- If it matches, use the email stored in that legacy document and create the Firebase Auth account with the typed password, set the display name to the username, then write the clean public-safe document under the new Auth uid (same as the existing migration step) and carry over points and wins.
+- Keep the existing server path untouched — use this fallback only when the server call fails.
+
+Acceptance checks: legacy username login works in preview AND in a build with no server (test by blocking the /api calls), legacy email login works, a wrong password is rejected, new signups and guest login still work, and the passwordHash field is gone from the new document. When done, show me the preview.
